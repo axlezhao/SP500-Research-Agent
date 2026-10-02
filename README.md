@@ -1,93 +1,204 @@
 # S&P 500 AI Research Agent
 
-Educational data science project using S&P 500 prices, financials, and news.
+A research platform on **free public data**, in three layers:
 
-Dataset:
+| Layer | What it does | Where |
+|---|---|---|
+| **Data science** | Point-in-time features from prices, SEC filings and macro data; three models compared with walk-forward validation; calibration, permutation importance, data-quality checks, an auto-generated research report | `ingest.py`, `features.py`, `model.py`, `validation.py`, `research.py` |
+| **Quant research** | Out-of-sample backtest on the index members of each date (long-only, long-short, benchmark), with costs, next-day execution, T-bill cash returns, quintile spreads and information coefficients | `backtest.py` |
+| **AI agent** | An LLM (DeepSeek or Claude) answering research questions with 15 tools over the data, the model, the backtest, and live news and SEC filings | `research_tools.py`, `llm_agent.py` |
 
-https://www.kaggle.com/datasets/sadiqguru/s-and-p-500-stock-data-along-with-financials-and-news
-
-## Setup
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Set up Kaggle credentials if you have not already:
-
-1. Go to your Kaggle account settings.
-2. Create an API token.
-3. Put `kaggle.json` in `~/.kaggle/kaggle.json`.
-
-## Download the Dataset Automatically
-
-Download all dataset files into `data/raw/`:
-
-```bash
-python download_kaggle.py
-```
-
-Or download and run the project pipeline in one command:
-
-```bash
-python run_pipeline.py --download-kaggle
-```
-
-Kaggle datasets are static files, not live online SQL databases. KaggleHub's pandas DataFrame option still downloads file bytes over HTTPS, so the data must exist locally at least temporarily.
-
-If KaggleHub fails with an SSL error from `storage.googleapis.com`, download the dataset ZIP from Kaggle in your browser, then run:
-
-```bash
-python download_kaggle.py --from-zip ~/Downloads/archive.zip
-```
-
-Or import the ZIP and run the pipeline in one command:
-
-```bash
-python run_pipeline.py --from-zip ~/Downloads/archive.zip
-```
-
-If you only want to test the project without Kaggle credentials:
-
-```bash
-python run_pipeline.py --make-sample
-```
-
-## Run the Agent
-
-After the pipeline has created features and trained the baseline model:
-
-```bash
-python -m src.sp500_agent.agent --ticker AAPL
-```
-
-This writes a markdown research brief to `reports/`.
-
-## What the Project Does
-
-- Downloads the full Kaggle dataset with KaggleHub.
-- Copies all CSV files into `data/raw/`.
-- Tries to infer which file contains prices, fundamentals, and news.
-- Engineers returns, volatility, momentum, sentiment, and fundamentals.
-- Trains a baseline 5-day return direction model.
-- Generates an analyst-style research brief.
+Everything is served through a **web dashboard**: a FastAPI backend and a React + TypeScript frontend with an overview, screener, stock pages, a streaming agent chat, and backtest, model and data views. The original Streamlit app remains as a lightweight alternative.
 
 This project is for education and research only. It is not financial advice.
 
-
-
-## Chatbot GUI
-
-Run the presentation-friendly chatbot app:
+## Quick start
 
 ```bash
-streamlit run streamlit_app.py
+pip install -r requirements.txt
+cp .env.example .env        # add SEC_USER_AGENT (a contact email SEC requires) and an LLM key
+python run_pipeline.py      # downloads ~12 years of data for ~600 stocks; about 4 minutes the first time
+cd web && npm install && npm run build && cd ..   # build the dashboard once (needs Node 20+)
+sp500-web                   # open http://127.0.0.1:8000
 ```
 
-Try prompts like:
+`streamlit run streamlit_app.py` still works if you'd rather not install Node.
 
-- `Analyze NVDA`
-- `Top 10 stocks`
-- `Weakest 10 stocks`
-- `Compare the model view for AAPL`
+For a quick trial run, use `python run_pipeline.py --limit 40`, which takes the first 40 current members and runs in under a minute. To use no network at all, `python run_pipeline.py --make-sample` builds a synthetic random-walk dataset. It's useful for testing, since no model should find an edge in it.
+
+## Data sources
+
+All free; only SEC needs a contact email and only Finnhub needs a key.
+
+| Source | Provides | Access |
+|---|---|---|
+| **Wikipedia** | Current S&P 500 constituents (sector, CIK) and the dated log of every index change since 1976 | Public pages |
+| **Yahoo Finance** (via `yfinance`) | Daily prices adjusted for splits and dividends, split history | No key; unofficial |
+| **SEC EDGAR** | Every figure companies report in 10-K/10-Q filings, with filing dates; recent filings list | No key; `SEC_USER_AGENT` with a contact email |
+| **FRED** | VIX, 3-month T-bill and 10-year Treasury yields | No key |
+| **Yahoo Finance RSS** or **Finnhub** | Recent headlines, fetched when the agent asks | RSS needs no key; Finnhub uses `FINNHUB_API_KEY` |
+
+Downloads are cached in `data/raw/live/`. Prices and macro data refresh after 12 hours; membership and fundamentals after 7 days. `--refresh` forces a fresh download. Yahoo's terms don't allow redistributing its data, so the downloaded data stays out of git (`data/` is ignored).
+
+The Kaggle dataset is still supported: `python run_pipeline.py --download-kaggle`, or `--from-zip ~/Downloads/archive.zip` if KaggleHub has trouble downloading.
+
+## 1. Data science
+
+**Point in time, everywhere.** Every input is limited to what was public at the close of its date:
+
+- **Fundamentals** come from SEC XBRL facts. Each period keeps its *first-reported* value, so later restatements never leak backwards. A fourth quarter is derived as the annual figure minus the first three quarters. A filing becomes usable the day *after* it was filed, and data older than about 18 months counts as unknown.
+- **Valuation ratios** (earnings yield, sales yield, book-to-market, P/E) pair each filing's share count with the *as-traded* price (Yahoo's split adjustment undone). Rows whose implied price-to-book is implausible are dropped, which happens when the cover page reports a different share class (e.g. Berkshire's Class A count).
+- **Macro series** are lagged one day.
+- **Index membership** is reconstructed by walking Wikipedia's change log backwards from today's list. The model trains, ranks and trades only stocks that were members on each date.
+
+**Features.**
+- **Price features:** returns, momentum, distance from the 50-day average, annualised volatility, volume ratio.
+- **Cross-sectional ranks** among that day's index members: price features plus value (earnings yield, sales yield, book-to-market), quality (margin, ROE), growth and size.
+- **Sector-relative return.**
+- **Market conditions:** VIX, its 20-day change, and the yield-curve spread.
+
+Features missing on more than 60% of rows, or constant, are left out automatically.
+
+**Target.** By default the model predicts whether a stock will **beat the median index member over the next 5 trading days** (`TARGET_MODE = "relative"` in `config.py`). The alternative, whether the stock closes higher, is dominated by market-wide moves that are the same for every stock. The predictions are used to rank stocks, so the relative target fits that use. On live 2014–2026 data it raised the out-of-sample rank IC from 0.015 to 0.023 and narrowed the long-short loss from −47% to −15%.
+
+**Validation.** Expanding-window walk-forward folds with a 5-session gap between training and test labels. Logistic regression, random forest and gradient boosting are scored by AUC, accuracy against a majority-class baseline, Brier score and information coefficient (IC; t-stat from non-overlapping dates). The best model is refit on all labelled data. Also reported:
+- **Calibration:** do the predicted probabilities match how often the event happened?
+- **Permutation importance:** how much the score drops when each feature is shuffled.
+- **Single-feature ICs:** each feature's own IC, next to the model's.
+
+**Data quality.** Each run writes `data/processed/data_quality.json` covering:
+- **Coverage:** of every source.
+- **Survivorship:** how many former members have usable prices.
+- **Reused tickers:** symbols dropped because they now belong to a different company.
+- **Price anomalies:** daily moves above 40% and gaps between trading days.
+
+The research report and the app's Data tab summarise it.
+
+Results go to `reports/research/`, including a readable `research_report.md`.
+
+## 2. Quant research
+
+`backtest.py` turns the walk-forward predictions into portfolios:
+
+- Every 5 sessions, rank that day's index members by predicted probability. Enter one session later and hold 5 sessions, so holding periods never overlap.
+- **Long-only** buys the top 20%, **long-short** also shorts the bottom 20%, and the **benchmark** holds every member equally.
+- Costs are charged on every unit of weight traded, from the previous period's drifted weights.
+- Sharpe ratios for long-only and the benchmark are measured in excess of 3-month T-bills (FRED). Long-short is self-financing, so it uses raw returns.
+- Reported: total return, CAGR, volatility, Sharpe, maximum drawdown, hit rate, turnover, information ratio, return by prediction quintile, and IC at each rebalance.
+
+**Honest result (live data, 2014–2026).**
+- **No model:** has a robust 5-day edge.
+- **Long top 20%:** trails the equal-weight benchmark.
+- **Long-short:** loses money after costs.
+
+That is the expected outcome for short-horizon prediction from public data. The project's value is in measuring it correctly. The run prints the current numbers.
+
+**Caveats.**
+- **Survivorship bias:** reduced, not removed. Former members delisted after mergers or failures often have no Yahoo data; the report states the coverage.
+- **Unadjusted corporate actions:** Yahoo occasionally misses a spin-off adjustment. These show up as extreme moves in the quality report, and the agent warns about them.
+- **Costs:** flat, with no market impact or short-borrow fees.
+
+## 3. AI agent
+
+`llm_agent.py` runs a tool-calling loop over these tools (`research_tools.py`):
+
+| Group | Tools |
+|---|---|
+| Overview | `dataset_overview` (as-of date, model quality, data coverage) |
+| Stocks | `search_companies`, `stock_snapshot`, `rank_stocks`, `screen_stocks`, `compare_stocks`, `price_history`, `sector_summary` |
+| Fundamentals | `fundamentals_history` (point-in-time SEC data with filing dates) |
+| Market | `macro_snapshot` (VIX, rates, yield curve vs. history), `index_changes` (S&P 500 additions and removals) |
+| Live lookups | `recent_news` (Yahoo RSS or Finnhub), `recent_filings` (SEC EDGAR 10-K/10-Q/8-K with links) |
+| Evidence | `model_performance`, `backtest_results` |
+
+The tools validate their arguments and return errors the model can recover from. `stock_snapshot` also flags recent moves that look like unadjusted corporate actions. The system prompt tells the agent to:
+- ground every number in a tool result;
+- state the data's as-of date;
+- treat headlines as context rather than proof;
+- explain the model's weak edge honestly;
+- not give buy or sell instructions.
+
+**Providers.** Put a key in `.env`:
+
+| Provider | Key | Default model | Override |
+|---|---|---|---|
+| DeepSeek (OpenAI-compatible) | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` | `DEEPSEEK_MODEL=deepseek-flash` |
+| Claude (Anthropic API) | `ANTHROPIC_API_KEY` | `claude-opus-5-5`, medium effort | `CLAUDE_AGENT_MODEL`, `CLAUDE_AGENT_EFFORT` |
+
+With both keys set, DeepSeek is used unless `LLM_PROVIDER=anthropic`. The Claude backend:
+- caches the system prompt and tools;
+- turns on Anthropic's server-side fallback, which retries a declined request on a recommended fallback model.
+
+Conversation history is append-only in both backends.
+
+```bash
+sp500-chat                                                        # interactive terminal chat
+sp500-chat "Compare NVDA and AMD on growth, valuation and recent filings"
+sp500-brief --ticker AAPL                                         # markdown brief, no LLM needed
+```
+
+In the app, the **Research agent** tab shows each tool call and its result and draws price charts. Without an LLM key it falls back to a rule-based assistant.
+
+## Web dashboard
+
+`sp500-web` (`src/sp500_agent/api/server.py`) serves a JSON API and the built React app from one origin. Pass `--port` if 8000 is taken.
+
+| View | What it shows |
+|---|---|
+| **Overview** | Model quality at a glance, highest- and lowest-ranked members, backtest curve, sector tilt, rates and VIX |
+| **Screener** | Every ranked member with probability, stance, returns, volatility and point-in-time fundamentals; sortable and filterable |
+| **Stock** | TradingView price chart with volume and ranges, percentile against other members, SEC fundamentals history with charts, live news and filings, one-click agent brief |
+| **Research agent** | Chat that streams each tool call as it happens (expandable to the raw result), then a formatted answer; conversation kept per browser tab |
+| **Backtest** | Growth of $1, drawdowns, quintile returns, rolling rank IC, statistics and caveats |
+| **Model lab** | Walk-forward comparison, AUC by fold, calibration, permutation importance, single-signal ICs, report download |
+| **Data** | Sources and fetch times, survivorship coverage, quality checks, macro charts, recent index changes |
+
+Built for daily use: light and dark themes (following the system or a toggle), ⌘K ticker search, keyboard-accessible tables and controls, layouts that work down to phone width, and a colour-blind-checked chart palette.
+
+**API.** `GET /api/overview`, `/api/stocks`, `/api/stocks/{ticker}` (plus `/prices`, `/fundamentals`, `/news`, `/filings`), `/api/backtest`, `/api/model`, `/api/data`; `POST /api/agent/chat` streams server-sent events (`tool_start`, `tool_end`, `answer`); `POST /api/reload` picks up a new pipeline run without restarting. Interactive docs at `/docs`.
+
+**Frontend development.** Run `sp500-web --reload` and, in `web/`, `npm run dev` (port 5173, proxying `/api`). Stack: Vite, React 19, TypeScript, Tailwind CSS 4, TanStack Query, Recharts, TradingView Lightweight Charts.
+
+## Pipeline options
+
+```
+python run_pipeline.py [--source live|kaggle|sample] [--start 2014-01-01] [--limit N] [--refresh]
+                       [--folds 5] [--cost-bps 10] [--quantile 0.2] [--max-rows 150000]
+```
+
+## Tests
+
+```bash
+pytest
+```
+
+About 130 tests run offline in roughly 25 seconds:
+- **Connectors:** every connector is tested against canned responses: Wikipedia HTML, Yahoo frames, SEC XBRL JSON (restatements, derived Q4, share classes), FRED CSV, RSS and Finnhub JSON, HTTP retries.
+- **Ingest:** the cached ingest runs end to end against fake services, including dropping reused tickers.
+- **Point in time:** a filing must be invisible on its filing day, macro data is lagged, and only index members are ranked and traded.
+- **Leakage:** on random-walk data the walk-forward AUC stays near 0.5.
+- **Backtest:** arithmetic, including excess-of-cash Sharpe.
+- **Tools and agent:** all 15 tools, and both agent loops with scripted fake clients.
+- **API:** every endpoint, including the streamed chat events, the rule-based fallback and serving the frontend's client-side routes.
+
+## Project layout
+
+```
+run_pipeline.py            data → features → walk-forward research → backtest → model + report
+web/                       React + TypeScript dashboard (Vite); built into web/dist and served by sp500-web
+streamlit_app.py           lightweight alternative UI
+src/sp500_agent/
+  sources/                 wikipedia.py, yahoo.py, sec.py, fred.py, news.py, http.py (rate limits, retries)
+  ingest.py                assemble live / Kaggle / sample data, cache, clean, quality report
+  features.py              time-series, cross-sectional, point-in-time fundamental and macro features
+  model.py                 model zoo, final fit, scoring index members on the latest date
+  validation.py            walk-forward folds, model comparison, IC, calibration, importance
+  backtest.py              portfolio backtest and performance statistics
+  research.py              orchestrates a research run, saves artifacts, writes the report
+  research_tools.py        the agent's tools
+  llm_agent.py             DeepSeek and Claude tool-calling agents, terminal chat
+  api/server.py            FastAPI backend: JSON endpoints, streaming agent chat, serves the dashboard
+  chat.py, agent.py        rule-based chat and markdown briefs (no LLM needed)
+  charts.py                Altair charts for the app
+tests/                     pytest suite
+```

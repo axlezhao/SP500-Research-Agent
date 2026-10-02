@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from .config import RAW_DIR
 
 
-def make_sample_data(seed: int = 7) -> None:
+def make_sample_data(seed: int = 7, raw_dir: Path = RAW_DIR) -> None:
+    """Write random-walk prices plus synthetic fundamentals and news. No model should beat chance on it."""
     rng = np.random.default_rng(seed)
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
     tickers = ["AAPL", "MSFT", "NVDA", "JPM", "XOM", "UNH", "AMZN", "GOOGL"]
     sectors = {"AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology", "JPM": "Financials", "XOM": "Energy", "UNH": "Health Care", "AMZN": "Consumer Discretionary", "GOOGL": "Communication Services"}
     dates = pd.bdate_range("2024-01-02", periods=260)
@@ -25,7 +28,7 @@ def make_sample_data(seed: int = 7) -> None:
         for date in dates[::10]:
             tone = rng.choice(["positive", "negative", "neutral"], p=[0.42, 0.28, 0.30])
             news_rows.append({"ticker": ticker, "date": date.date().isoformat(), "title": f"{ticker} {rng.choice(phrases[tone])}", "summary": f"{ticker} news item with {tone} implications.", "sentiment": tone})
-    pd.DataFrame(price_rows).to_csv(RAW_DIR / "sample_prices.csv", index=False)
-    pd.DataFrame(fundamentals).to_csv(RAW_DIR / "sample_fundamentals.csv", index=False)
-    pd.DataFrame(news_rows).to_csv(RAW_DIR / "sample_news.csv", index=False)
+    pd.DataFrame(price_rows).to_csv(raw_dir / "sample_prices.csv", index=False)
+    pd.DataFrame(fundamentals).to_csv(raw_dir / "sample_fundamentals.csv", index=False)
+    pd.DataFrame(news_rows).to_csv(raw_dir / "sample_news.csv", index=False)
 

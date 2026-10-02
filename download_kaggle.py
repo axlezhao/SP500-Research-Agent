@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.sp500_agent.config import KAGGLE_DATASET
-from src.sp500_agent.kaggle_loader import download_kaggle_dataset, import_from_zip
+from sp500_agent.config import KAGGLE_DATASET
+from sp500_agent.kaggle_loader import download_kaggle_dataset, import_from_zip
 
 
 def main() -> None:
