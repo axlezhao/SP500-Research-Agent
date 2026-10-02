@@ -1,7 +1,10 @@
+import os
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Where data/, models/, reports/ and web/dist live. Defaults to the source checkout; set SP500_HOME
+# when the package is installed elsewhere (e.g. in a container).
+PROJECT_ROOT = Path(os.environ.get("SP500_HOME") or Path(__file__).resolve().parents[2])
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 SAMPLE_DIR = RAW_DIR / "sample"

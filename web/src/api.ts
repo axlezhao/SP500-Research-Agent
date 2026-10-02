@@ -199,7 +199,7 @@ export const api = {
   backtest: () => get<BacktestData>("/api/backtest"),
   model: () => get<ModelData>("/api/model"),
   data: () => get<DataPageData>("/api/data"),
-  agentStatus: () => get<{ providers: string[]; mode: "llm" | "rule-based" }>("/api/agent/status"),
+  agentStatus: () => get<{ providers: string[]; mode: "llm" | "rule-based"; demo: boolean; limits: { per_hour: number | null; per_day: number | null } }>("/api/agent/status"),
 };
 
 export type AgentEvent =
@@ -216,7 +216,15 @@ export async function streamChat(sessionId: string, message: string, onEvent: (e
     body: JSON.stringify({ session_id: sessionId, message }),
     signal,
   });
-  if (!response.ok || !response.body) throw new ApiError(response.status, response.statusText);
+  if (!response.ok || !response.body) {
+    let detail = response.statusText;
+    try {
+      detail = (await response.json()).detail ?? detail;
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(response.status, detail);
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";

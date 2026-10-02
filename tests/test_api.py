@@ -108,3 +108,40 @@ def test_frontend_is_served_with_spa_fallback(client):
     assert "<title>app</title>" in client.get("/stock/AAPL").text  # client-side route
     assert client.get("/assets/app.js").text == "console.log('hi')"
     assert client.get("/api/nope").status_code == 404
+
+
+def test_chat_limiter_counts_per_client_and_per_day():
+    from sp500_agent.api.server import ChatLimiter
+
+    now = [0.0]
+    limiter = ChatLimiter(per_hour=2, per_day=3, clock=lambda: now[0])
+    assert limiter.check("a") is None and limiter.check("a") is None
+    assert "2 questions per hour" in limiter.check("a")
+    assert limiter.check("b") is None  # another visitor
+    assert "daily" in limiter.check("c")  # 3 accepted today
+    now[0] = 3601
+    assert "daily" in limiter.check("a")  # hourly window reset, daily cap still reached
+    now[0] = 86401
+    assert limiter.check("a") is None
+
+
+def test_demo_mode_limits_chat_and_locks_reload(live_research_data):
+    from sp500_agent.api.server import ChatLimiter
+
+    app = create_app(loader=lambda: live_research_data, providers=lambda: [], static_dir=None, demo=True, limiter=ChatLimiter(per_hour=1))
+    with TestClient(app) as demo_client:
+        status = demo_client.get("/api/agent/status").json()
+        assert status["demo"] is True and status["limits"]["per_hour"] == 1
+        ok = demo_client.post("/api/agent/chat", json={"session_id": "s", "message": "top 3"}, headers={"X-Forwarded-For": "1.2.3.4"})
+        assert ok.status_code == 200
+        limited = demo_client.post("/api/agent/chat", json={"session_id": "s", "message": "top 3"}, headers={"X-Forwarded-For": "1.2.3.4, 10.0.0.1"})
+        assert limited.status_code == 429 and "per hour" in limited.json()["detail"]
+        assert demo_client.post("/api/agent/chat", json={"session_id": "t", "message": "top 3"}, headers={"X-Forwarded-For": "5.6.7.8"}).status_code == 200
+        assert demo_client.post("/api/reload").status_code == 403
+
+
+def test_admin_token_guards_reload(live_research_data):
+    app = create_app(loader=lambda: live_research_data, providers=lambda: [], static_dir=None, admin_token="secret")
+    with TestClient(app) as admin_client:
+        assert admin_client.post("/api/reload").status_code == 403
+        assert admin_client.post("/api/reload", headers={"X-Admin-Token": "secret"}).status_code == 200

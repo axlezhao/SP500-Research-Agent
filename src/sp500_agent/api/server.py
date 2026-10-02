@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import threading
-from collections import OrderedDict
+import time
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -56,6 +58,49 @@ class ChatRequest(BaseModel):
 
 class ResetRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=100)
+
+
+class ChatLimiter:
+    """Caps chat messages per client per hour and in total per day (a cost guard for public demos).
+
+    Limits of 0 or None mean unlimited. Counts live in memory, so they reset when the server restarts.
+    """
+
+    def __init__(self, per_hour: int | None = None, per_day: int | None = None, clock: Callable[[], float] = time.monotonic):
+        self.per_hour = per_hour or None
+        self.per_day = per_day or None
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._clients: dict[str, deque] = defaultdict(deque)
+        self._all: deque = deque()
+
+    def check(self, client: str) -> str | None:
+        """Record one message for `client`, or return why it is refused."""
+        now = self._clock()
+        with self._lock:
+            mine = self._clients[client]
+            while mine and now - mine[0] > 3600:
+                mine.popleft()
+            while self._all and now - self._all[0] > 86400:
+                self._all.popleft()
+            if self.per_day and len(self._all) >= self.per_day:
+                return "This demo has reached its daily question limit. Please try again tomorrow."
+            if self.per_hour and len(mine) >= self.per_hour:
+                return f"You've reached the demo limit of {self.per_hour} questions per hour. Please try again later."
+            mine.append(now)
+            self._all.append(now)
+            return None
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
 
 
 class ResearchService:
@@ -156,10 +201,23 @@ def create_app(
     agent_factory: Callable | None = None,
     providers: Callable[[], list[str]] | None = None,
     static_dir: Path | None = WEB_DIST,
+    demo: bool | None = None,
+    limiter: ChatLimiter | None = None,
+    admin_token: str | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="S&P 500 Research Agent", version="0.5.0")
+    """Build the app. Demo mode (DEMO_MODE=1) rate-limits the chat and locks admin endpoints.
+
+    Settings default to environment variables: DEMO_MODE, CHAT_LIMIT_PER_HOUR, CHAT_LIMIT_PER_DAY, ADMIN_TOKEN.
+    """
+    demo = _env_flag("DEMO_MODE") if demo is None else demo
+    limiter = limiter or ChatLimiter(
+        _env_int("CHAT_LIMIT_PER_HOUR", 20 if demo else 0), _env_int("CHAT_LIMIT_PER_DAY", 300 if demo else 0)
+    )
+    admin_token = admin_token if admin_token is not None else os.environ.get("ADMIN_TOKEN") or None
+    app = FastAPI(title="S&P 500 Research Agent", version="0.6.0")
     service = ResearchService(loader, agent_factory, providers)
     app.state.service = service
+    app.state.limiter = limiter
 
     @app.exception_handler(ToolInputError)
     def tool_input_error(request, exc: ToolInputError) -> JSONResponse:
@@ -178,7 +236,11 @@ def create_app(
         return {"status": "ok"}
 
     @app.post("/api/reload")
-    def reload() -> dict:
+    def reload(x_admin_token: str | None = Header(default=None)) -> dict:
+        if admin_token is not None and x_admin_token != admin_token:
+            raise HTTPException(403, "Admin token required.")
+        if admin_token is None and demo:
+            raise HTTPException(403, "Reloading is disabled in demo mode.")
         service.reload()
         return {"status": "reloaded", "as_of": to_json_safe(service.data.scored["date"].max())}
 
@@ -337,7 +399,12 @@ def create_app(
     @app.get("/api/agent/status")
     def agent_status() -> dict:
         available = service.providers()
-        return {"providers": available, "mode": "llm" if available else "rule-based"}
+        return {
+            "providers": available,
+            "mode": "llm" if available else "rule-based",
+            "demo": demo,
+            "limits": {"per_hour": limiter.per_hour, "per_day": limiter.per_day},
+        }
 
     @app.post("/api/agent/reset")
     def agent_reset(request: ResetRequest) -> dict:
@@ -345,7 +412,12 @@ def create_app(
         return {"status": "reset"}
 
     @app.post("/api/agent/chat")
-    def agent_chat(request: ChatRequest) -> StreamingResponse:
+    def agent_chat(request: ChatRequest, http: Request) -> StreamingResponse:
+        # Behind a hosting proxy the visitor's address is the first X-Forwarded-For entry.
+        client = (http.headers.get("x-forwarded-for", "").split(",")[0].strip()) or (http.client.host if http.client else "unknown")
+        refusal = limiter.check(client)
+        if refusal:
+            raise HTTPException(429, refusal)
         events: queue.Queue = queue.Queue()
 
         def work() -> None:

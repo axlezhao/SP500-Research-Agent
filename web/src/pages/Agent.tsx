@@ -275,7 +275,10 @@ export default function Agent() {
             </button>
           )}
         </div>
-        <p className="mt-1.5 text-center text-[11px] text-muted">Research output for education, not investment advice. Answers can be wrong; check the numbers in the linked views.</p>
+        <p className="mt-1.5 text-center text-[11px] text-muted">
+          {status.data?.demo && status.data.limits.per_hour ? `Public demo: up to ${status.data.limits.per_hour} questions per hour. ` : ""}
+          Research output for education, not investment advice. Answers can be wrong; check the numbers in the linked views.
+        </p>
       </form>
     </div>
   );

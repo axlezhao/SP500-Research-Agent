@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, axle]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  web:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+
+  docker:
+    name: Docker image (sample-data smoke test)
+    runs-on: ubuntu-latest
+    needs: [python, web]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: sp500-research:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Start the container on the synthetic sample (no network data, no keys)
+        run: docker run -d --name app -p 8000:8000 -e DATA_SOURCE=sample sp500-research:ci
+      - name: Wait for the API and check the main endpoints
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/api/health >/dev/null; then break; fi
+            sleep 3
+          done
+          curl -fsS http://localhost:8000/api/overview | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['stocks_ranked'] > 0, d; print('ranked', d['stocks_ranked'])"
+          curl -fsS http://localhost:8000/api/backtest > /dev/null
+          curl -fsS http://localhost:8000/ | grep -q '<div id="root">'
+      - name: Container logs
+        if: always()
+        run: docker logs app
