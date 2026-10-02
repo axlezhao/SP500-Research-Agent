@@ -9,7 +9,10 @@ MODEL_DIR = PROJECT_ROOT / "models"
 REPORT_DIR = PROJECT_ROOT / "reports"
 
 FEATURES_PATH = PROCESSED_DIR / "research_features.parquet"
+NEWS_PATH = PROCESSED_DIR / "news.parquet"
 MODEL_PATH = MODEL_DIR / "return_direction_model.joblib"
+# Walk-forward predictions, model comparison, backtest results and the generated research report.
+RESEARCH_DIR = REPORT_DIR / "research"
 
 KAGGLE_DATASET = "sadiqguru/s-and-p-500-stock-data-along-with-financials-and-news"
 # Kaggle downloads and ZIP imports are extracted here with their folder structure intact,
@@ -18,6 +21,8 @@ KAGGLE_DIR_NAME = "kaggle_sp500_dataset"
 
 # Prediction horizon in trading days.
 HORIZON_DAYS = 5
+# Backtests trade this many sessions after the signal date (signals use the close; trading at that same close is optimistic).
+EXECUTION_LAG_DAYS = 1
 TRADING_DAYS_PER_YEAR = 252
 # News timestamps are interpreted in US market time; items at or after the close count toward the next session.
 MARKET_TIMEZONE = "America/New_York"

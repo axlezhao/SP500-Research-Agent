@@ -1,108 +1,315 @@
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 import streamlit as st
 
-from sp500_agent.chat import answer_message, ranking_answer
+from sp500_agent import charts
+from sp500_agent.chat import answer_message
 from sp500_agent.config import FEATURES_PATH, MODEL_PATH
-from sp500_agent.features import load_features as read_features
-from sp500_agent.formatting import fmt_pct, fmt_prob
-from sp500_agent.model import load_model, score_latest
-
+from sp500_agent.formatting import company_label, fmt_pct, fmt_prob
+from sp500_agent.llm_agent import configured_providers, create_agent
+from sp500_agent.research_tools import ResearchData, ResearchToolkit
 
 st.set_page_config(page_title="S&P 500 Research Agent", page_icon="📈", layout="wide")
 
-GREETING = "Ask about a ticker like `NVDA`, compare rankings with `top 10 stocks`, or ask for the weakest names."
+GREETING = (
+    "Ask about a stock (`How does NVDA look?`), a comparison (`Compare AAPL, MSFT and GOOGL`), "
+    "a screen (`Low-volatility stocks the model likes`), or the evidence (`Should I trust this model?`)."
+)
+AGENT_MODE, RULE_MODE = "AI agent", "Rule-based"
+PROVIDER_LABELS = {"deepseek": "DeepSeek", "anthropic": "Claude"}
 
 
-@st.cache_data(show_spinner=False)
-def load_features() -> pd.DataFrame:
-    return read_features() if FEATURES_PATH.exists() else pd.DataFrame()
+@st.cache_resource(show_spinner="Loading data and model...")
+def load_research_data() -> ResearchData | None:
+    if not FEATURES_PATH.exists() or not MODEL_PATH.exists():
+        return None
+    return ResearchData.load()
 
 
-@st.cache_resource(show_spinner=False)
-def load_scoring_bundle():
-    return load_model() if MODEL_PATH.exists() else None
+def chart_mode() -> str:
+    theme = getattr(st.context, "theme", None)
+    return "dark" if theme is not None and getattr(theme, "type", None) == "dark" else "light"
 
 
-@st.cache_data(show_spinner=False)
-def load_scored_latest() -> pd.DataFrame:
-    features = load_features()
-    model = load_scoring_bundle()
-    if features.empty or model is None:
-        return pd.DataFrame()
-    return score_latest(features, model)
+def price_history_frame(features: pd.DataFrame, ticker: str, days: int = 252) -> pd.DataFrame:
+    return features.loc[features["ticker"] == ticker, ["date", "close"]].sort_values("date").tail(days)
 
 
-def price_chart(ticker: str, days: int = 252) -> pd.DataFrame:
-    features = load_features()
-    chart = features[features["ticker"] == ticker].sort_values("date").tail(days)
-    return chart[["date", "close"]].set_index("date")
+# -- chat -----------------------------------------------------------------------------------------
+def get_agent(provider: str):
+    key = f"agent::{provider}"
+    if key not in st.session_state:
+        st.session_state[key] = create_agent(ResearchToolkit(data), provider=provider)
+    return st.session_state[key]
 
 
-def ask(question: str, scored: pd.DataFrame) -> None:
-    answer = answer_message(question, scored)
-    st.session_state.messages.append({"role": "user", "content": question})
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer.text, "table": answer.table, "ticker": answer.ticker}
-    )
+def reset_conversation() -> None:
+    st.session_state.messages = [{"role": "assistant", "content": GREETING}]
+    for key in [k for k in st.session_state if str(k).startswith("agent::")]:
+        del st.session_state[key]
 
 
-def render_message(message: dict, scored: pd.DataFrame) -> None:
+def ask_rule_based(question: str) -> dict:
+    answer = answer_message(question, data.scored)
+    return {"role": "assistant", "content": answer.text, "table": answer.table, "ticker": answer.ticker}
+
+
+def ask_agent(question: str, provider: str) -> dict:
+    agent = get_agent(provider)
+    with st.status(f"Researching with {PROVIDER_LABELS[provider]}...", expanded=False) as status:
+        try:
+            reply = agent.ask(question)
+        except Exception as exc:  # network, auth or rate-limit problems
+            status.update(label="The agent hit an error", state="error")
+            return {"role": "assistant", "content": f"The AI agent could not answer: `{type(exc).__name__}: {exc}`"}
+        status.update(label=f"Used {len(reply.tool_calls)} tool call(s)", state="complete")
+    return {
+        "role": "assistant",
+        "content": reply.text or "(No answer.)",
+        "tool_calls": [vars(call) for call in reply.tool_calls],
+        "meta": f"{PROVIDER_LABELS[reply.provider]} · {reply.model} · {reply.usage.get('input_tokens', 0):,} in / {reply.usage.get('output_tokens', 0):,} out tokens",
+    }
+
+
+def render_tool_calls(calls: list[dict]) -> None:
+    with st.expander(f"🔧 {len(calls)} tool call(s)"):
+        for call in calls:
+            args = ", ".join(f"{k}={v!r}" for k, v in call["arguments"].items())
+            st.markdown(f"**`{call['name']}({args})`**" + (f" — error: {call['error']}" if call["error"] else ""))
+            if call["result"] is not None:
+                st.json(call["result"], expanded=False)
+    for call in calls:
+        result = call.get("result") or {}
+        if call["name"] == "price_history" and result.get("series"):
+            history = pd.DataFrame(result["series"]).assign(date=lambda d: pd.to_datetime(d["date"]))
+            st.altair_chart(charts.price_chart(history, result["ticker"], chart_mode()), width="stretch")
+
+
+def escape_dollars(text: str) -> str:
+    # Streamlit renders text between two $ signs as LaTeX, which mangles prices like "$119 → $100".
+    return re.sub(r"(?<!\\)\$", r"\\$", text)
+
+
+def render_message(message: dict) -> None:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.markdown(escape_dollars(message["content"]))
+        if message.get("tool_calls"):
+            render_tool_calls(message["tool_calls"])
         table = message.get("table")
         if table is not None:
             st.dataframe(table, width="stretch", hide_index=True)
         ticker = message.get("ticker")
-        match = scored[scored["ticker"] == ticker] if ticker else scored.iloc[0:0]
+        match = data.scored[data.scored["ticker"] == ticker] if ticker else data.scored.iloc[0:0]
         if not match.empty:
             row = match.iloc[0]
-            metric_cols = st.columns(4)
-            metric_cols[0].metric("Model probability", fmt_prob(row["up_probability_5d"]))
-            metric_cols[1].metric("Rank", f"{int(row['rank'])}/{len(scored)}")
-            metric_cols[2].metric("20D return", fmt_pct(row.get("return_20d")))
-            metric_cols[3].metric("Volatility (ann.)", fmt_pct(row.get("volatility_20d")))
-            chart = price_chart(ticker)
-            if not chart.empty:
-                st.line_chart(chart, width="stretch")
+            cols = st.columns(4)
+            cols[0].metric("Model probability", fmt_prob(row["up_probability_5d"]))
+            cols[1].metric("Rank", f"{int(row['rank'])}/{len(data.scored)}")
+            cols[2].metric("20D return", fmt_pct(row.get("return_20d")))
+            cols[3].metric("Volatility (ann.)", fmt_pct(row.get("volatility_20d")))
+            st.altair_chart(charts.price_chart(price_history_frame(data.features, ticker), ticker, chart_mode()), width="stretch")
+        if message.get("meta"):
+            st.caption(message["meta"])
 
 
+# -- page -----------------------------------------------------------------------------------------
 st.title("S&P 500 Research Agent")
-st.caption("Educational model output only. Not financial advice.")
+st.caption("A data science, quant research and AI agent project. Educational output only, not financial advice.")
 
-features = load_features()
-model = load_scoring_bundle()
-scored = load_scored_latest()
-
-if features.empty or model is None or scored.empty:
-    st.error("Run `python run_pipeline.py` first so the app has features and a trained model.")
+data = load_research_data()
+if data is None:
+    st.error("Run `python run_pipeline.py` first so the app has features, a trained model and research results.")
     st.stop()
 
+artifacts = data.artifacts
+metrics = data.bundle.get("metrics", {})
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": GREETING}]
+    reset_conversation()
 
+providers = configured_providers()
 with st.sidebar:
-    st.subheader("Model Snapshot")
-    st.metric("Stocks ranked", f"{len(scored):,}")
-    st.metric("Feature rows", f"{len(features):,}")
-    latest_date = scored["date"].max()
-    st.metric("Latest price date", latest_date.date().isoformat() if pd.notna(latest_date) else "n/a")
-    metrics = model.get("metrics", {})
-    if "auc" in metrics:
-        st.metric("Holdout ROC AUC", f"{metrics['auc']:.3f}", help="Time-ordered holdout. 0.500 means no skill.")
+    st.subheader("Snapshot")
+    st.metric("As of", data.scored["date"].max().date().isoformat())
+    cols = st.columns(2)
+    cols[0].metric("Stocks", f"{len(data.scored):,}")
+    cols[1].metric("Walk-forward AUC", f"{metrics['auc_mean']:.3f}" if "auc_mean" in metrics else "n/a", help="Out-of-sample. 0.500 means no skill.")
+    st.caption(f"Model: {data.bundle.get('model_name', 'n/a')}")
     st.divider()
-    tickers = sorted(scored["ticker"].tolist())
-    selected = st.selectbox("Ticker", tickers, index=tickers.index("NVDA") if "NVDA" in tickers else 0)
-    if st.button("Analyze", width="stretch"):
-        ask(selected, scored)
 
-user_message = st.chat_input("Ask about a stock or ranking")
-if user_message:
-    ask(user_message, scored)
+    st.subheader("Assistant")
+    mode = st.segmented_control("Mode", [AGENT_MODE, RULE_MODE], default=AGENT_MODE if providers else RULE_MODE, label_visibility="collapsed") or RULE_MODE
+    provider = None
+    if mode == AGENT_MODE:
+        if not providers:
+            st.info("Add `DEEPSEEK_API_KEY` or `ANTHROPIC_API_KEY` to `.env` (see `.env.example`) to enable the AI agent.")
+            mode = RULE_MODE
+        else:
+            provider = st.selectbox("Provider", providers, format_func=lambda p: PROVIDER_LABELS.get(p, p)) if len(providers) > 1 else providers[0]
+            st.caption(f"{PROVIDER_LABELS[provider]} · `{get_agent(provider).model}`")
+    if st.button("New conversation", width="stretch"):
+        reset_conversation()
+    st.divider()
+    tickers = sorted(data.scored["ticker"].tolist())
+    selected = st.selectbox("Quick brief", tickers, index=tickers.index("NVDA") if "NVDA" in tickers else 0)
+    analyze = st.button("Analyze", width="stretch")
 
-for message in st.session_state.messages:
-    render_message(message, scored)
+chat_tab, backtest_tab, model_tab, data_tab = st.tabs(["💬 Research agent", "📊 Backtest", "🔬 Model lab", "🗂 Data & screener"])
 
-with st.expander("Current top-ranked stocks", expanded=False):
-    st.dataframe(ranking_answer(scored, n=10).table, width="stretch", hide_index=True)
+with chat_tab:
+    for message in st.session_state.messages:
+        render_message(message)
+    question = st.chat_input("Ask about a stock, a sector, the model or the backtest")
+    if analyze:
+        question = f"Give me a research brief on {selected}." if mode == AGENT_MODE else selected
+    if question:
+        st.session_state.messages.append({"role": "user", "content": question})
+        render_message(st.session_state.messages[-1])
+        reply = ask_agent(question, provider) if mode == AGENT_MODE else ask_rule_based(question)
+        st.session_state.messages.append(reply)
+        st.rerun()
+
+with backtest_tab:
+    summary = artifacts.get("backtest_summary")
+    returns = artifacts.get("backtest_returns")
+    if summary is None or returns is None:
+        st.info("No backtest yet. Run `python run_pipeline.py`.")
+    else:
+        stats = summary.set_index("strategy")
+        config = artifacts.get("backtest_config") or {}
+        st.markdown(
+            f"Out-of-sample predictions from walk-forward validation, {returns['date'].min().date()} to {returns['date'].max().date()} "
+            f"({len(returns)} rebalances). Every {config.get('holding_days', 5)} sessions: rank stocks, enter one session later, hold "
+            f"{config.get('holding_days', 5)} sessions. Costs {config.get('cost_bps', 10):g} bps per unit traded."
+        )
+        cols = st.columns(4)
+        cols[0].metric("Long top 20%", fmt_pct(stats.loc["long_only", "total_return"]), f"{(stats.loc['long_only', 'total_return'] - stats.loc['benchmark', 'total_return']) * 100:+.1f} pts vs benchmark")
+        cols[1].metric("Long-short", fmt_pct(stats.loc["long_short", "total_return"]))
+        cols[2].metric("Long-short Sharpe", f"{stats.loc['long_short', 'sharpe']:.2f}")
+        cols[3].metric("Rank IC (mean)", f"{stats.loc['long_short', 'ic_mean']:.3f}", help="Average rank correlation between prediction and realised return at each rebalance.")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Growth of $1, after costs**")
+            st.altair_chart(charts.equity_curve(returns, chart_mode()), width="stretch")
+        with right:
+            st.markdown("**Drawdown from peak**")
+            st.altair_chart(charts.drawdown_chart(returns, chart_mode()), width="stretch")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Return by prediction quintile**")
+            quantiles = artifacts.get("quantile_returns")
+            if quantiles is not None and not quantiles.empty:
+                st.altair_chart(charts.quintile_chart(quantiles, chart_mode()), width="stretch")
+        with right:
+            st.markdown("**Strategy statistics**")
+            headers = {"total_return": "Total return", "cagr": "CAGR", "ann_volatility": "Volatility", "sharpe": "Sharpe", "max_drawdown": "Max drawdown", "hit_rate": "Hit rate", "avg_turnover": "Turnover"}
+            table = stats[list(headers)].rename(index=charts.STRATEGY_LABELS, columns=headers)
+            percent = ["Total return", "CAGR", "Volatility", "Max drawdown", "Hit rate"]
+            st.dataframe(table.style.format({c: "{:.1%}" for c in percent} | {"Sharpe": "{:.2f}", "Turnover": "{:.2f}"}), width="stretch")
+        st.caption(
+            "Caveats: the data holds today's index members only (survivorship bias flatters long strategies); "
+            "costs are a flat charge with no market impact or short-borrow fees."
+        )
+
+with model_tab:
+    comparison = artifacts.get("model_comparison")
+    if comparison is None:
+        st.info("No model research yet. Run `python run_pipeline.py`.")
+    else:
+        st.markdown(
+            "Three models compared with expanding-window walk-forward validation: each fold trains on earlier dates only, "
+            "with a 5-session gap so no training label overlaps the test period."
+        )
+        display = comparison.assign(model=comparison["model"].map(charts.MODEL_LABELS).fillna(comparison["model"]))
+        st.dataframe(
+            display[["model", "auc_mean", "auc_std", "accuracy", "baseline_accuracy", "brier", "ic_mean", "ic_tstat"]],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "model": "Model",
+                "auc_mean": st.column_config.NumberColumn("AUC", format="%.3f", help="Mean over folds. 0.5 = no skill."),
+                "auc_std": st.column_config.NumberColumn("AUC sd", format="%.3f"),
+                "accuracy": st.column_config.NumberColumn("Accuracy", format="%.3f"),
+                "baseline_accuracy": st.column_config.NumberColumn("Baseline", format="%.3f", help="Always predicting the more common direction."),
+                "brier": st.column_config.NumberColumn("Brier", format="%.4f", help="Mean squared error of the probabilities; lower is better."),
+                "ic_mean": st.column_config.NumberColumn("Mean IC", format="%.4f"),
+                "ic_tstat": st.column_config.NumberColumn("IC t-stat", format="%.2f"),
+            },
+        )
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**AUC by fold** (dashed line = no skill)")
+            folds = artifacts.get("fold_metrics")
+            if folds is not None:
+                st.altair_chart(charts.fold_auc_chart(folds.assign(test_start=pd.to_datetime(folds["test_start"]), test_end=pd.to_datetime(folds["test_end"])), chart_mode()), width="stretch")
+        with right:
+            st.markdown(f"**Calibration of {charts.MODEL_LABELS.get(data.bundle.get('model_name'), data.bundle.get('model_name'))}** (dashed = perfect)")
+            calibration = artifacts.get("calibration")
+            if calibration is not None:
+                st.altair_chart(charts.calibration_chart(calibration, chart_mode()), width="stretch")
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**Permutation importance** (last fold, unseen data)")
+            importance = artifacts.get("feature_importance")
+            if importance is not None and not importance.empty:
+                st.altair_chart(charts.importance_chart(importance, mode=chart_mode()), width="stretch")
+        with right:
+            st.markdown("**Single-signal information coefficients**")
+            signals = artifacts.get("signal_ic")
+            if signals is not None:
+                st.dataframe(
+                    signals[["signal", "ic_mean", "ic_tstat", "ic_positive_share"]],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "signal": "Signal",
+                        "ic_mean": st.column_config.NumberColumn("Mean IC", format="%.4f"),
+                        "ic_tstat": st.column_config.NumberColumn("t-stat", format="%.2f", help="From non-overlapping dates. |t| > 2 is the usual bar."),
+                        "ic_positive_share": st.column_config.NumberColumn("Days IC > 0", format="percent"),
+                    },
+                )
+        if artifacts.get("report"):
+            st.download_button("Download the full research report (Markdown)", artifacts["report"], file_name="research_report.md", mime="text/markdown")
+
+with data_tab:
+    eda = artifacts.get("eda")
+    if eda:
+        cols = st.columns(4)
+        cols[0].metric("Rows", f"{eda['rows']:,}")
+        cols[1].metric("Stocks", f"{eda['tickers']:,}")
+        cols[2].metric("Trading days", f"{eda['trading_days']:,}")
+        cols[3].metric("5-day up rate", fmt_pct(eda["up_rate_5d"]), help="The bar a classifier has to beat.")
+        fr = eda["forward_return_5d"]
+        st.caption(
+            f"{eda['start']} to {eda['end']}. 5-day forward returns: mean {fmt_pct(fr['mean'])}, std {fmt_pct(fr['std'])}, skew {fr['skew']:.2f}, "
+            f"excess kurtosis {fr['excess_kurtosis']:.2f}. Rows with recent news: {fmt_pct(eda['share_of_rows_with_recent_news'])}."
+        )
+    st.markdown("**Screener** (latest date)")
+    screen = data.scored.copy()
+    screen["company"] = screen.apply(company_label, axis=1)
+    sectors = sorted(screen["sector"].dropna().unique()) if "sector" in screen else []
+    chosen = st.multiselect("Sectors", sectors, placeholder="All sectors")
+    if chosen:
+        screen = screen[screen["sector"].isin(chosen)]
+    columns = [c for c in ["rank", "ticker", "company", "sector", "up_probability_5d", "return_5d", "return_20d", "momentum_60d", "volatility_20d", "sentiment_20d", "market_cap", "pe_ratio"] if c in screen.columns]
+    st.dataframe(
+        screen[columns],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "rank": "Rank",
+            "ticker": "Ticker",
+            "company": "Company",
+            "sector": "Sector",
+            "up_probability_5d": st.column_config.ProgressColumn("Model probability", min_value=0.0, max_value=1.0, format="percent"),
+            "return_5d": st.column_config.NumberColumn("5D return", format="percent"),
+            "return_20d": st.column_config.NumberColumn("20D return", format="percent"),
+            "momentum_60d": st.column_config.NumberColumn("60D momentum", format="percent"),
+            "volatility_20d": st.column_config.NumberColumn("Volatility (ann.)", format="percent"),
+            "sentiment_20d": st.column_config.NumberColumn("News sentiment", format="%.2f"),
+            "market_cap": st.column_config.NumberColumn("Market cap", format="compact"),
+            "pe_ratio": st.column_config.NumberColumn("P/E", format="%.1f"),
+        },
+    )

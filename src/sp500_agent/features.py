@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import FEATURES_PATH, HORIZON_DAYS, TRADING_DAYS_PER_YEAR
+from .config import EXECUTION_LAG_DAYS, FEATURES_PATH, HORIZON_DAYS, NEWS_PATH, TRADING_DAYS_PER_YEAR
 
 
 POSITIVE_WORDS = {"beat", "beats", "strong", "growth", "raises", "expand", "expands", "upgrade", "bullish", "record"}
@@ -90,7 +90,15 @@ def build_research_features(prices: pd.DataFrame, fundamentals: pd.DataFrame, ne
     prices["volatility_20d"] = prices.groupby("ticker")["return_1d"].transform(
         lambda returns: returns.rolling(20).std()
     ) * np.sqrt(TRADING_DAYS_PER_YEAR)
+    prices["ma_gap_50d"] = prices["close"] / by_ticker.transform(lambda close: close.rolling(50).mean()) - 1
+    if "volume" in prices.columns:
+        volume = pd.to_numeric(prices["volume"], errors="coerce")
+        prices["volume_ratio_20d"] = volume / volume.groupby(prices["ticker"]).transform(lambda v: v.rolling(20).mean())
     prices["future_return_5d"] = by_ticker.shift(-HORIZON_DAYS) / prices["close"] - 1
+    # The return a backtest can actually earn: enter EXECUTION_LAG_DAYS after the signal, hold HORIZON_DAYS.
+    prices["tradable_return_5d"] = (
+        by_ticker.shift(-(HORIZON_DAYS + EXECUTION_LAG_DAYS)) / by_ticker.shift(-EXECUTION_LAG_DAYS) - 1
+    )
     prices["target_up_5d"] = (prices["future_return_5d"] > 0).astype(float).where(prices["future_return_5d"].notna())
 
     sentiment = align_news_to_trading_days(prepare_news_sentiment(news), prices)
@@ -111,7 +119,25 @@ def build_research_features(prices: pd.DataFrame, fundamentals: pd.DataFrame, ne
         if col in features.columns:
             features[col] = pd.to_numeric(features[col], errors="coerce")
     features = features.replace([np.inf, -np.inf], np.nan)
-    return features.dropna(subset=["return_5d", "return_20d", "volatility_20d"]).reset_index(drop=True)
+    features = features.dropna(subset=["return_5d", "return_20d", "volatility_20d"]).reset_index(drop=True)
+    return add_cross_sectional_features(features)
+
+
+def add_cross_sectional_features(features: pd.DataFrame) -> pd.DataFrame:
+    """Compare each stock with the rest of the market on the same date.
+
+    Percentile ranks remove market-wide moves, so the model learns which stocks are relatively
+    strong rather than whether the whole market went up. Sector comes from the fundamentals
+    snapshot; sector membership rarely changes, so this is a mild approximation.
+    """
+    features = features.copy()
+    by_date = features.groupby("date")
+    for col in ["return_20d", "momentum_60d", "volatility_20d"]:
+        features[f"{col}_xs_rank"] = by_date[col].rank(pct=True)
+    if "sector" in features.columns:
+        sector_median = features.groupby(["date", "sector"])["return_20d"].transform("median")
+        features["return_20d_vs_sector"] = features["return_20d"] - sector_median
+    return features
 
 
 def save_features(features: pd.DataFrame, path: Path = FEATURES_PATH) -> Path:
@@ -124,3 +150,17 @@ def load_features(path: Path = FEATURES_PATH) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"{path} not found. Run python run_pipeline.py first.")
     return pd.read_parquet(path)
+
+
+def save_news(news: pd.DataFrame, path: Path = NEWS_PATH) -> Path:
+    """Keep headlines so the agent can quote recent news, not just the aggregated sentiment."""
+    columns = [col for col in ["ticker", "date", "title", "summary", "sentiment", "source", "url"] if col in news.columns]
+    news = news[columns].copy()
+    news["sentiment_score"] = _sentiment_scores(news)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    news.sort_values(["ticker", "date"]).to_parquet(path, index=False)
+    return path
+
+
+def load_news_headlines(path: Path = NEWS_PATH) -> pd.DataFrame:
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=["ticker", "date", "title", "sentiment_score"])

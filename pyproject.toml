@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sp500-agent"
-version = "0.2.0"
-description = "Educational S&P 500 research agent: price, news and fundamentals features with a baseline return-direction model."
+version = "0.3.0"
+description = "S&P 500 research platform: walk-forward ML, a portfolio backtest, and an LLM agent that answers questions with research tools."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,9 +17,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-app = ["streamlit>=1.50"]
+app = ["streamlit>=1.50", "altair>=5"]
+llm = ["openai>=1.40", "anthropic>=1.0", "python-dotenv>=1.0"]
 kaggle = ["kagglehub[pandas-datasets]>=0.3"]
 dev = ["pytest>=8"]
+
+[project.scripts]
+sp500-chat = "sp500_agent.llm_agent:main"
+sp500-brief = "sp500_agent.agent:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

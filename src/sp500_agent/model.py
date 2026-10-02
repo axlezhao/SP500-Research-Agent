@@ -1,110 +1,107 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import joblib
-import numpy as np
 import pandas as pd
+from sklearn.base import ClassifierMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from .config import HORIZON_DAYS, MODEL_PATH
+from .config import MODEL_PATH
 
 
 # Only features that were known on each row's date. Snapshot fundamentals are excluded
 # because they come from the download date and would leak future information into history.
-NUMERIC_FEATURES = ["return_5d", "return_20d", "momentum_60d", "volatility_20d", "sentiment_20d", "news_count_20d"]
+NUMERIC_FEATURES = [
+    "return_5d",
+    "return_20d",
+    "momentum_60d",
+    "volatility_20d",
+    "ma_gap_50d",
+    "volume_ratio_20d",
+    "sentiment_20d",
+    "news_count_20d",
+    "return_20d_xs_rank",
+    "momentum_60d_xs_rank",
+    "volatility_20d_xs_rank",
+    "return_20d_vs_sector",
+]
 CATEGORICAL_FEATURES = ["sector"]
 TARGET = "target_up_5d"
 # Tickers whose last price is older than this (relative to the newest price) are not ranked.
 MAX_STALENESS_DAYS = 7
+
+MODEL_FACTORIES: dict[str, Callable[[], ClassifierMixin]] = {
+    "logistic_regression": lambda: LogisticRegression(C=0.5, max_iter=2000),
+    "random_forest": lambda: RandomForestClassifier(
+        n_estimators=150, min_samples_leaf=50, max_features="sqrt", n_jobs=-1, random_state=42
+    ),
+    "gradient_boosting": lambda: HistGradientBoostingClassifier(
+        max_iter=200, learning_rate=0.05, max_leaf_nodes=15, l2_regularization=1.0, random_state=42
+    ),
+}
+DEFAULT_MODEL = "random_forest"
 
 
 def available_features(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     return [col for col in NUMERIC_FEATURES if col in df.columns], [col for col in CATEGORICAL_FEATURES if col in df.columns]
 
 
-def _make_pipeline(numeric: list[str], categorical: list[str]) -> Pipeline:
+def make_pipeline(model_name: str, numeric: list[str], categorical: list[str]) -> Pipeline:
+    if model_name not in MODEL_FACTORIES:
+        raise ValueError(f"Unknown model {model_name!r}. Choose from: {', '.join(MODEL_FACTORIES)}")
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", Pipeline([("imputer", SimpleImputer(strategy="median", keep_empty_features=True)), ("scaler", StandardScaler())]), numeric),
-            ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent", keep_empty_features=True)), ("encoder", OneHotEncoder(handle_unknown="ignore"))]), categorical),
+            ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent", keep_empty_features=True)), ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), categorical),
         ],
         remainder="drop",
     )
-    return Pipeline([("preprocessor", preprocessor), ("model", RandomForestClassifier(n_estimators=120, min_samples_leaf=10, random_state=42, class_weight="balanced_subsample", n_jobs=-1))])
+    return Pipeline([("preprocessor", preprocessor), ("model", MODEL_FACTORIES[model_name]())])
 
 
-def time_split(df: pd.DataFrame, test_fraction: float = 0.2, embargo_days: int = HORIZON_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Train on earlier dates and test on later ones.
-
-    The first `embargo_days` sessions after the cut are skipped: training rows near the cut have
-    targets that look `HORIZON_DAYS` ahead, so testing on those sessions would overlap their labels.
-    """
-    dates = np.sort(df["date"].unique())
-    cut = int(len(dates) * (1 - test_fraction))
-    if cut < 1 or cut + embargo_days >= len(dates):
-        raise ValueError(f"Not enough distinct dates ({len(dates)}) for a time split with a {embargo_days}-day gap.")
-    train = df[df["date"] < dates[cut]]
-    test = df[df["date"] >= dates[cut + embargo_days]]
-    return train, test
-
-
-def _sample(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+def sample_rows(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     return df.sample(n=max_rows, random_state=42) if len(df) > max_rows else df
 
 
-def train_return_direction_model(
+def fit_model(model_name: str, rows: pd.DataFrame, numeric: list[str], categorical: list[str], max_rows: int = 200_000) -> Pipeline:
+    rows = sample_rows(rows.dropna(subset=[TARGET]), max_rows)
+    pipeline = make_pipeline(model_name, numeric, categorical)
+    pipeline.fit(rows[numeric + categorical], rows[TARGET].astype(int))
+    return pipeline
+
+
+def train_final_model(
     features: pd.DataFrame,
+    model_name: str = DEFAULT_MODEL,
+    validation: dict | None = None,
     max_rows: int = 200_000,
     model_path: Path | None = MODEL_PATH,
-) -> tuple[dict, str]:
-    """Evaluate on a time-ordered holdout, then refit on all labelled rows and save the bundle."""
+) -> dict:
+    """Fit on every labelled row so current predictions use the most recent data, and save the bundle.
+
+    `validation` holds the walk-forward metrics that justify this model; they are stored with it.
+    """
     numeric, categorical = available_features(features)
-    columns = numeric + categorical
-    labelled = features.dropna(subset=[TARGET])
-    train, test = time_split(labelled)
-
-    sampled_train = _sample(train, max_rows)
-    holdout_pipeline = _make_pipeline(numeric, categorical)
-    holdout_pipeline.fit(sampled_train[columns], sampled_train[TARGET].astype(int))
-    y_test = test[TARGET].astype(int)
-    predictions = holdout_pipeline.predict(test[columns])
-    majority_class = int(train[TARGET].mean() >= 0.5)
-    metrics = {
-        "accuracy": accuracy_score(y_test, predictions),
-        "baseline_accuracy": accuracy_score(y_test, np.full(len(y_test), majority_class)),
-        "auc": roc_auc_score(y_test, holdout_pipeline.predict_proba(test[columns])[:, 1]) if y_test.nunique() == 2 else float("nan"),
-        "train_end": pd.Timestamp(train["date"].max()),
-        "test_start": pd.Timestamp(test["date"].min()),
-        "test_end": pd.Timestamp(test["date"].max()),
+    pipeline = fit_model(model_name, features, numeric, categorical, max_rows)
+    bundle = {
+        "pipeline": pipeline,
+        "model_name": model_name,
+        "numeric": numeric,
+        "categorical": categorical,
+        "trained_through": pd.Timestamp(features.dropna(subset=[TARGET])["date"].max()),
+        "metrics": validation or {},
     }
-
-    report = (
-        f"Time-ordered holdout: train through {metrics['train_end'].date()}, "
-        f"test {metrics['test_start'].date()} to {metrics['test_end'].date()} "
-        f"({HORIZON_DAYS}-session gap between them).\n\n"
-        + classification_report(y_test, predictions, zero_division=0)
-        + f"\nROC AUC: {metrics['auc']:.3f}  (0.500 = no skill)"
-        + f"\nAccuracy: {metrics['accuracy']:.3f}  vs. always predicting "
-        + f"'{'up' if majority_class else 'down'}': {metrics['baseline_accuracy']:.3f}\n"
-    )
-    if len(sampled_train) < len(train):
-        report += f"Holdout training sample: {len(sampled_train):,} of {len(train):,} rows.\n"
-
-    # The saved model uses every labelled row, including the holdout period, so predictions use the most recent data.
-    final_rows = _sample(labelled, max_rows)
-    pipeline = _make_pipeline(numeric, categorical)
-    pipeline.fit(final_rows[columns], final_rows[TARGET].astype(int))
-    bundle = {"pipeline": pipeline, "numeric": numeric, "categorical": categorical, "metrics": metrics}
     if model_path is not None:
         model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(bundle, model_path)
-    return bundle, report
+    return bundle
 
 
 def load_model(path: Path = MODEL_PATH) -> dict:

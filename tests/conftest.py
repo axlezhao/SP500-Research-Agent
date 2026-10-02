@@ -25,3 +25,28 @@ def sample_raw_dir(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def sample_features(sample_raw_dir) -> pd.DataFrame:
     return build_research_features(load_prices(sample_raw_dir), load_fundamentals(sample_raw_dir), load_news(sample_raw_dir))
+
+
+
+@pytest.fixture(scope="session")
+def research_dir(tmp_path_factory) -> Path:
+    return tmp_path_factory.mktemp("research")
+
+
+@pytest.fixture(scope="session")
+def research_run(sample_features, research_dir):
+    from sp500_agent.research import run_research
+
+    return run_research(sample_features, output_dir=research_dir, model_path=None)
+
+
+@pytest.fixture(scope="session")
+def research_data(sample_features, sample_raw_dir, research_run, research_dir):
+    """Loaded the way the app loads it, so saving and reading the artifacts is exercised too."""
+    from sp500_agent.features import _sentiment_scores
+    from sp500_agent.research import load_artifacts
+    from sp500_agent.research_tools import ResearchData
+
+    news = load_news(sample_raw_dir)
+    news = news.assign(sentiment_score=_sentiment_scores(news))
+    return ResearchData(sample_features, research_run.bundle, news, load_artifacts(research_dir))
