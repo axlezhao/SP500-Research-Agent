@@ -8,7 +8,7 @@ A research platform on **free public data**, in three layers:
 | **Quant research** | Out-of-sample backtest on the index members of each date (long-only, long-short, benchmark), with costs, next-day execution, T-bill cash returns, quintile spreads and information coefficients | `backtest.py` |
 | **AI agent** | An LLM (DeepSeek or Claude) answering research questions with 15 tools over the data, the model, the backtest, and live news and SEC filings | `research_tools.py`, `llm_agent.py` |
 
-A Streamlit app ties it together: agent chat, backtest, model lab, and data and screener tabs.
+Everything is served through a **web dashboard**: a FastAPI backend and a React + TypeScript frontend with an overview, screener, stock pages, a streaming agent chat, and backtest, model and data views. The original Streamlit app remains as a lightweight alternative.
 
 This project is for education and research only. It is not financial advice.
 
@@ -18,8 +18,11 @@ This project is for education and research only. It is not financial advice.
 pip install -r requirements.txt
 cp .env.example .env        # add SEC_USER_AGENT (a contact email SEC requires) and an LLM key
 python run_pipeline.py      # downloads ~12 years of data for ~600 stocks; about 4 minutes the first time
-streamlit run streamlit_app.py
+cd web && npm install && npm run build && cd ..   # build the dashboard once (needs Node 20+)
+sp500-web                   # open http://127.0.0.1:8000
 ```
+
+`streamlit run streamlit_app.py` still works if you'd rather not install Node.
 
 For a quick trial run, use `python run_pipeline.py --limit 40`, which takes the first 40 current members and runs in under a minute. To use no network at all, `python run_pipeline.py --make-sample` builds a synthetic random-walk dataset. It's useful for testing, since no model should find an edge in it.
 
@@ -136,6 +139,26 @@ sp500-brief --ticker AAPL                                         # markdown bri
 
 In the app, the **Research agent** tab shows each tool call and its result and draws price charts. Without an LLM key it falls back to a rule-based assistant.
 
+## Web dashboard
+
+`sp500-web` (`src/sp500_agent/api/server.py`) serves a JSON API and the built React app from one origin. Pass `--port` if 8000 is taken.
+
+| View | What it shows |
+|---|---|
+| **Overview** | Model quality at a glance, highest- and lowest-ranked members, backtest curve, sector tilt, rates and VIX |
+| **Screener** | Every ranked member with probability, stance, returns, volatility and point-in-time fundamentals; sortable and filterable |
+| **Stock** | TradingView price chart with volume and ranges, percentile against other members, SEC fundamentals history with charts, live news and filings, one-click agent brief |
+| **Research agent** | Chat that streams each tool call as it happens (expandable to the raw result), then a formatted answer; conversation kept per browser tab |
+| **Backtest** | Growth of $1, drawdowns, quintile returns, rolling rank IC, statistics and caveats |
+| **Model lab** | Walk-forward comparison, AUC by fold, calibration, permutation importance, single-signal ICs, report download |
+| **Data** | Sources and fetch times, survivorship coverage, quality checks, macro charts, recent index changes |
+
+Built for daily use: light and dark themes (following the system or a toggle), ⌘K ticker search, keyboard-accessible tables and controls, layouts that work down to phone width, and a colour-blind-checked chart palette.
+
+**API.** `GET /api/overview`, `/api/stocks`, `/api/stocks/{ticker}` (plus `/prices`, `/fundamentals`, `/news`, `/filings`), `/api/backtest`, `/api/model`, `/api/data`; `POST /api/agent/chat` streams server-sent events (`tool_start`, `tool_end`, `answer`); `POST /api/reload` picks up a new pipeline run without restarting. Interactive docs at `/docs`.
+
+**Frontend development.** Run `sp500-web --reload` and, in `web/`, `npm run dev` (port 5173, proxying `/api`). Stack: Vite, React 19, TypeScript, Tailwind CSS 4, TanStack Query, Recharts, TradingView Lightweight Charts.
+
 ## Pipeline options
 
 ```
@@ -149,19 +172,21 @@ python run_pipeline.py [--source live|kaggle|sample] [--start 2014-01-01] [--lim
 pytest
 ```
 
-About 120 tests run offline in roughly 20 seconds:
+About 130 tests run offline in roughly 25 seconds:
 - **Connectors:** every connector is tested against canned responses: Wikipedia HTML, Yahoo frames, SEC XBRL JSON (restatements, derived Q4, share classes), FRED CSV, RSS and Finnhub JSON, HTTP retries.
 - **Ingest:** the cached ingest runs end to end against fake services, including dropping reused tickers.
 - **Point in time:** a filing must be invisible on its filing day, macro data is lagged, and only index members are ranked and traded.
 - **Leakage:** on random-walk data the walk-forward AUC stays near 0.5.
 - **Backtest:** arithmetic, including excess-of-cash Sharpe.
 - **Tools and agent:** all 15 tools, and both agent loops with scripted fake clients.
+- **API:** every endpoint, including the streamed chat events, the rule-based fallback and serving the frontend's client-side routes.
 
 ## Project layout
 
 ```
 run_pipeline.py            data → features → walk-forward research → backtest → model + report
-streamlit_app.py           agent chat, backtest, model lab, data & screener
+web/                       React + TypeScript dashboard (Vite); built into web/dist and served by sp500-web
+streamlit_app.py           lightweight alternative UI
 src/sp500_agent/
   sources/                 wikipedia.py, yahoo.py, sec.py, fred.py, news.py, http.py (rate limits, retries)
   ingest.py                assemble live / Kaggle / sample data, cache, clean, quality report
@@ -172,6 +197,7 @@ src/sp500_agent/
   research.py              orchestrates a research run, saves artifacts, writes the report
   research_tools.py        the agent's tools
   llm_agent.py             DeepSeek and Claude tool-calling agents, terminal chat
+  api/server.py            FastAPI backend: JSON endpoints, streaming agent chat, serves the dashboard
   chat.py, agent.py        rule-based chat and markdown briefs (no LLM needed)
   charts.py                Altair charts for the app
 tests/                     pytest suite

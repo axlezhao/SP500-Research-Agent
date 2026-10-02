@@ -322,6 +322,10 @@ class ResearchToolkit:
                 return candidate
         return self._row(ticker)["ticker"]  # raises with suggestions
 
+    def resolve(self, ticker: str) -> str:
+        """Public form of _symbol: the canonical ticker for any stock with data, or ToolInputError."""
+        return self._symbol(ticker)
+
     def _known_tickers(self) -> set:
         if not hasattr(self, "_known"):
             self._known = set(self.data.features["ticker"].unique())

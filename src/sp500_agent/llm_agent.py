@@ -87,12 +87,22 @@ class ResearchAgent(ABC):
         self.model = model
         self.max_tool_rounds = max_tool_rounds
         self.history: list = []
+        self.on_event = None  # optional callback(dict) for progress: tool_start / tool_end events
+
+    def _emit(self, event: dict) -> None:
+        if self.on_event is not None:
+            self.on_event(event)
 
     def reset(self) -> None:
         self.history = []
 
     def run_tool(self, name: str, arguments) -> tuple[str, ToolCall, bool]:
         """Execute one tool call. Returns (content for the model, record for display, is_error)."""
+        content, call, is_error = self._run_tool(name, arguments)
+        self._emit({"type": "tool_end", "name": call.name, "arguments": call.arguments, "error": call.error, "result": call.result})
+        return content, call, is_error
+
+    def _run_tool(self, name: str, arguments) -> tuple[str, ToolCall, bool]:
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments) if arguments.strip() else {}
@@ -100,6 +110,7 @@ class ResearchAgent(ABC):
                 call = ToolCall(name, {"raw": arguments}, error="Arguments were not valid JSON.")
                 return f"Error: {call.error} Send the arguments as a JSON object.", call, True
         call = ToolCall(name, dict(arguments or {}))
+        self._emit({"type": "tool_start", "name": name, "arguments": call.arguments})
         try:
             call.result = self.toolkit.call(name, call.arguments)
         except ToolInputError as exc:

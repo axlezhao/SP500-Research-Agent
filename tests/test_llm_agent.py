@@ -198,3 +198,16 @@ def test_auto_provider_prefers_configured_key(toolkit, no_dotenv):
 def test_missing_keys_give_a_clear_error(toolkit, no_dotenv):
     with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY or ANTHROPIC_API_KEY"):
         create_agent(toolkit)
+
+
+def test_progress_events_bracket_each_tool_call(toolkit):
+    client = ScriptedChatClient([
+        chat_response("tool_calls", None, [("stock_snapshot", '{"ticker": "NVDA"}'), ("stock_snapshot", '{"ticker": "NOPE"}')]),
+        chat_response("stop", "Done."),
+    ])
+    agent = DeepSeekResearchAgent(toolkit, model="m", client=client)
+    events = []
+    agent.on_event = events.append
+    agent.ask("?")
+    assert [(e["type"], e["name"]) for e in events] == [("tool_start", "stock_snapshot"), ("tool_end", "stock_snapshot")] * 2
+    assert events[1]["result"]["ticker"] == "NVDA" and events[3]["error"]
