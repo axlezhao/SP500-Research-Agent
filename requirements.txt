@@ -1,8 +1,11 @@
-pandas
-numpy
-scikit-learn
-matplotlib
-seaborn
-joblib
-kagglehub[pandas-datasets]
-streamlit
+# Versions this project was last tested with (Python 3.13). `pip install -r requirements.txt`
+# installs them plus the project itself in editable mode, so `import sp500_agent` works anywhere.
+pandas==3.0.6
+numpy==2.5.3
+scikit-learn==1.9.1
+joblib==1.6.0
+pyarrow==25.0.1
+streamlit==1.64.0
+kagglehub[pandas-datasets]==1.0.2
+pytest==9.1.1
+-e .

@@ -10,14 +10,14 @@
 
 ## Phase 2: Stronger Modeling
 
-- Add walk-forward validation.
+- Add walk-forward validation (a single time-ordered holdout with an embargo is in place).
 - Add sector-relative features.
 - Add backtesting.
 - Add better sentiment with FinBERT or embeddings.
 
 ## Phase 3: Product Layer
 
-- Add Streamlit dashboard.
-- Add conversational query interface.
+- Add Streamlit dashboard. (done)
+- Add conversational query interface. (rule-based version done; an LLM with tool calls is next)
 - Add model explanations and portfolio simulation.
 

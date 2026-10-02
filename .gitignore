@@ -9,3 +9,6 @@ models/
 reports/
 *.joblib
 .streamlit/
+.pytest_cache/
+*.egg-info/
+build/

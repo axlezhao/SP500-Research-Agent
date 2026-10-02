@@ -8,11 +8,13 @@ https://www.kaggle.com/datasets/sadiqguru/s-and-p-500-stock-data-along-with-fina
 
 ## Setup
 
-Install dependencies:
+Install dependencies (this also installs the project in editable mode, so `import sp500_agent` works):
 
 ```bash
 pip install -r requirements.txt
 ```
+
+`requirements.txt` pins the versions the project was last tested with. For a looser install, use `pip install -e ".[app,kaggle,dev]"`.
 
 Set up Kaggle credentials if you have not already:
 
@@ -22,7 +24,10 @@ Set up Kaggle credentials if you have not already:
 
 ## Download the Dataset Automatically
 
-Download all dataset files into `data/raw/`:
+If you imported the Kaggle data with an older version of this project, the per-ticker price files were flattened into `data/raw/`. Remove those files and re-import with `--overwrite`.
+
+
+Download all dataset files into `data/raw/kaggle_sp500_dataset/` (subfolders such as `price_data/` are kept):
 
 ```bash
 python download_kaggle.py
@@ -59,27 +64,40 @@ python run_pipeline.py --make-sample
 After the pipeline has created features and trained the baseline model:
 
 ```bash
-python -m src.sp500_agent.agent --ticker AAPL
+python -m sp500_agent.agent --ticker AAPL
 ```
 
 This writes a markdown research brief to `reports/`.
 
 ## What the Project Does
 
-- Downloads the full Kaggle dataset with KaggleHub.
-- Copies all CSV files into `data/raw/`.
+- Downloads the full Kaggle dataset with KaggleHub, keeping its folder structure.
 - Tries to infer which file contains prices, fundamentals, and news.
-- Engineers returns, volatility, momentum, sentiment, and fundamentals.
-- Trains a baseline 5-day return direction model.
-- Generates an analyst-style research brief.
+- Engineers returns, annualised volatility, 60-day momentum, and news sentiment.
+- Trains a baseline 5-day return direction model and evaluates it on a time-ordered holdout.
+- Generates an analyst-style research brief from each stock's most recent trading day.
+
+## How the Model Is Evaluated
+
+- **Time-ordered holdout.** The model is trained on earlier dates and tested on later ones, with a 5-session gap so training targets never overlap the test period. A random split would let neighbouring days of the same stock appear on both sides, which inflates the scores (on the random-walk sample data it reported ROC AUC ≈ 0.69 where the true answer is 0.50).
+- **Baseline.** The report compares accuracy with always predicting the more common direction.
+- **Fundamentals are display-only.** The dataset has one current snapshot of market cap, P/E, revenue, etc. Attaching it to every historical row would leak future information, so these fields appear in briefs but are not model inputs.
+- **Current predictions.** The latest rows, whose 5-day outcome is still unknown, are kept for scoring and excluded from training. Tickers whose last price is more than 7 days older than the newest price are not ranked.
+- **News.** Timestamps with a timezone are converted to New York time. Items published at or after 4pm count toward the next session, and weekend or holiday news moves to the next trading day. 20-day sentiment is averaged over articles only, so a quiet period reads as unknown rather than neutral.
+
+## Tests
+
+```bash
+pytest
+```
+
+The suite includes a leakage check: on random-walk sample data the holdout ROC AUC must stay close to 0.5.
 
 This project is for education and research only. It is not financial advice.
 
-
-
 ## Chatbot GUI
 
-Run the presentation-friendly chatbot app:
+Run the presentation-friendly chatbot app (it reads `data/processed/research_features.parquet` and the trained model):
 
 ```bash
 streamlit run streamlit_app.py
@@ -91,3 +109,4 @@ Try prompts like:
 - `Top 10 stocks`
 - `Weakest 10 stocks`
 - `Compare the model view for AAPL`
+- `What's the rank of $ON?` (a `$` marks a ticker that is also an English word)

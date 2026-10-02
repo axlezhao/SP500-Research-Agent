@@ -3,9 +3,9 @@ from __future__ import annotations
 import shutil
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from .config import KAGGLE_DATASET, RAW_DIR
+from .config import KAGGLE_DATASET, KAGGLE_DIR_NAME, RAW_DIR
 
 
 def _import_kagglehub():
@@ -18,16 +18,28 @@ def _import_kagglehub():
     return kagglehub
 
 
-def copy_csv_files(csv_files: list[Path], raw_dir: Path = RAW_DIR, overwrite: bool = False) -> list[Path]:
-    raw_dir.mkdir(parents=True, exist_ok=True)
+def _safe_relative_parts(name: str) -> tuple[str, ...] | None:
+    """Return path parts that cannot escape the destination folder, or None to skip the entry."""
+    parts = tuple(part for part in PurePosixPath(name.replace("\\", "/")).parts if part not in ("", ".", "..", "/"))
+    if not parts or "__MACOSX" in parts:
+        return None
+    return parts
+
+
+def copy_dataset_tree(dataset_path: Path, raw_dir: Path = RAW_DIR, overwrite: bool = False) -> list[Path]:
+    """Copy every CSV under dataset_path into raw_dir/kaggle_sp500_dataset, keeping subfolders."""
+    destination_root = raw_dir / KAGGLE_DIR_NAME
     copied: list[Path] = []
-    for csv_file in csv_files:
-        destination = raw_dir / csv_file.name
-        if destination.exists() and not overwrite:
-            copied.append(destination)
+    for csv_file in sorted(Path(dataset_path).rglob("*.csv")):
+        parts = _safe_relative_parts(csv_file.relative_to(dataset_path).as_posix())
+        if parts is None:
             continue
-        shutil.copy2(csv_file, destination)
+        destination = destination_root.joinpath(*parts)
         copied.append(destination)
+        if destination.exists() and not overwrite:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(csv_file, destination)
     return copied
 
 
@@ -38,7 +50,7 @@ def download_kaggle_dataset(
     retries: int = 3,
     retry_wait_seconds: int = 10,
 ) -> list[Path]:
-    """Download the full Kaggle dataset and copy CSV files into data/raw."""
+    """Download the full Kaggle dataset and copy its CSV files into data/raw."""
     kagglehub = _import_kagglehub()
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -68,35 +80,41 @@ def download_kaggle_dataset(
             )
             time.sleep(retry_wait_seconds)
 
-    csv_files = sorted(dataset_path.rglob("*.csv"))
-    if not csv_files:
+    copied = copy_dataset_tree(dataset_path, raw_dir, overwrite=overwrite)
+    if not copied:
         raise FileNotFoundError(f"No CSV files were found in downloaded dataset: {dataset_path}")
-    return copy_csv_files(csv_files, raw_dir, overwrite=overwrite)
+    return copied
 
 
 def import_from_zip(zip_path: Path, raw_dir: Path = RAW_DIR, overwrite: bool = False) -> list[Path]:
-    """Extract CSV files from a browser-downloaded Kaggle ZIP into data/raw."""
+    """Extract CSV files from a browser-downloaded Kaggle ZIP into data/raw, keeping subfolders."""
     zip_path = Path(zip_path).expanduser()
     if not zip_path.exists():
         raise FileNotFoundError(f"ZIP file not found: {zip_path}")
 
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    destination_root = raw_dir / KAGGLE_DIR_NAME
     copied: list[Path] = []
     with zipfile.ZipFile(zip_path) as archive:
-        csv_members = [member for member in archive.namelist() if member.lower().endswith(".csv")]
-        if not csv_members:
-            raise FileNotFoundError(f"No CSV files found inside ZIP: {zip_path}")
-
-        for member in csv_members:
-            destination = raw_dir / Path(member).name
-            if destination.exists() and not overwrite:
-                copied.append(destination)
+        for member in archive.namelist():
+            if not member.lower().endswith(".csv"):
                 continue
+            parts = _safe_relative_parts(member)
+            if parts is None:
+                continue
+            destination = destination_root.joinpath(*parts)
+            copied.append(destination)
+            if destination.exists() and not overwrite:
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(member) as source, destination.open("wb") as target:
                 shutil.copyfileobj(source, target)
-            copied.append(destination)
+
+    if not copied:
+        raise FileNotFoundError(f"No CSV files found inside ZIP: {zip_path}")
     return copied
 
 
 def list_raw_csvs(raw_dir: Path = RAW_DIR) -> list[Path]:
-    return sorted(raw_dir.glob("*.csv"))
+    if not raw_dir.exists():
+        return []
+    return sorted(path for path in raw_dir.rglob("*.csv") if "__MACOSX" not in path.parts)

@@ -4,59 +4,58 @@ import argparse
 
 import pandas as pd
 
-from .config import PROCESSED_DIR, REPORT_DIR
+from .config import REPORT_DIR
+from .features import load_features
+from .formatting import company_label, fmt_money, fmt_num, fmt_pct, fmt_price, fmt_prob, stance
 from .model import load_model, score_latest
 
 
-def _fmt_pct(value) -> str:
-    return "n/a" if pd.isna(value) else f"{float(value) * 100:.1f}%"
+def brief_markdown(row: pd.Series, total: int, heading: str = "#") -> str:
+    """Research brief for one scored row (from score_latest)."""
+    ticker = row["ticker"]
+    name = company_label(row)
+    title = f"{ticker}: {name}" if name != ticker else ticker
+    news_count = row.get("news_count_20d")
+    return f"""{heading} {title} Research Brief
 
+{heading}# Agent View
 
-def _fmt_num(value) -> str:
-    if pd.isna(value):
-        return "n/a"
-    value = float(value)
-    return f"${value / 1_000_000_000:.1f}B" if abs(value) >= 1_000_000_000 else f"{value:.2f}"
+The model view is **{stance(float(row['up_probability_5d']))}**. {ticker} ranks **{int(row['rank'])} of {total}** by predicted 5-day upward-move probability, as of **{pd.Timestamp(row['date']).date()}**.
+
+This is educational model output, not financial advice.
+
+{heading}# Key Signals
+
+- Predicted 5-day upward probability: **{fmt_prob(row['up_probability_5d'])}**
+- Latest close: **{fmt_price(row.get('close'))}**
+- 5-day return: **{fmt_pct(row.get('return_5d'))}**
+- 20-day return: **{fmt_pct(row.get('return_20d'))}**
+- 60-day momentum: **{fmt_pct(row.get('momentum_60d'))}**
+- 20-day volatility (annualised): **{fmt_pct(row.get('volatility_20d'))}**
+- 20-day news sentiment: **{fmt_num(row.get('sentiment_20d'))}** (−1 to +1, average over articles)
+- 20-day news count: **{fmt_num(news_count, 0)}**
+
+{heading}# Fundamentals Snapshot
+
+Latest values from the dataset. They are shown for context and are not model inputs, because no history is available for them.
+
+- Sector: **{row.get('sector') if pd.notna(row.get('sector')) else 'n/a'}**
+- Market cap: **{fmt_money(row.get('market_cap'))}**
+- P/E ratio: **{fmt_num(row.get('pe_ratio'), 1)}**
+- Revenue: **{fmt_money(row.get('revenue'))}**
+- Profit margin: **{fmt_pct(row.get('profit_margin'))}**
+- Debt to equity: **{fmt_num(row.get('debt_to_equity'))}**
+- ROE: **{fmt_pct(row.get('roe'))}**
+"""
 
 
 def make_research_brief(ticker: str) -> str:
     ticker = ticker.upper()
-    features = pd.read_csv(PROCESSED_DIR / "research_features.csv", parse_dates=["date"])
-    scored = score_latest(features, load_model())
+    scored = score_latest(load_features(), load_model())
     match = scored[scored["ticker"] == ticker]
     if match.empty:
         raise ValueError(f"{ticker} not found. Try one of: {', '.join(scored['ticker'].head(20).tolist())}")
-    row = match.iloc[0]
-    rank = int(scored.index.get_loc(row.name)) + 1
-    stance = "constructive" if row["up_probability_5d"] >= 0.60 else "cautious" if row["up_probability_5d"] <= 0.40 else "neutral"
-    brief = f"""# {ticker} Research Brief
-
-## Agent View
-
-The model view is **{stance}**. {ticker} ranks **{rank} of {len(scored)}** by predicted 5-day upward-move probability.
-
-This is educational model output, not financial advice.
-
-## Key Signals
-
-- Predicted 5-day upward probability: **{row['up_probability_5d']:.1%}**
-- Latest close: **{_fmt_num(row.get('close'))}**
-- 5-day return: **{_fmt_pct(row.get('return_5d'))}**
-- 20-day return: **{_fmt_pct(row.get('return_20d'))}**
-- 20-day volatility: **{_fmt_pct(row.get('volatility_20d'))}**
-- 20-day news sentiment: **{row.get('sentiment_20d', 0):.2f}**
-- 20-day news count: **{row.get('news_count_20d', 0):.0f}**
-
-## Fundamentals Snapshot
-
-- Sector: **{row.get('sector', 'n/a')}**
-- Market cap: **{_fmt_num(row.get('market_cap'))}**
-- P/E ratio: **{_fmt_num(row.get('pe_ratio'))}**
-- Revenue: **{_fmt_num(row.get('revenue'))}**
-- Profit margin: **{_fmt_pct(row.get('profit_margin'))}**
-- Debt to equity: **{_fmt_num(row.get('debt_to_equity'))}**
-- ROE: **{_fmt_pct(row.get('roe'))}**
-"""
+    brief = brief_markdown(match.iloc[0], len(scored))
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / f"{ticker}_research_brief.md").write_text(brief, encoding="utf-8")
     return brief
@@ -71,4 +70,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
