@@ -23,7 +23,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from .config import PROJECT_ROOT
+from .config import TARGET_DESCRIPTION, load_environment
 from .research_tools import TOOL_DEFINITIONS, ResearchData, ResearchToolkit, ToolInputError
 
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
@@ -32,14 +32,16 @@ DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 MAX_TOOL_ROUNDS = 8
 MAX_TOKENS = 16_000
 
-SYSTEM_PROMPT = """You are the research assistant in an educational S&P 500 data science project. You answer questions about stocks, sectors, the project's machine-learning model and its backtest by calling the tools provided. The tools are your only source of market data.
+SYSTEM_PROMPT = f"""You are the research assistant in an educational S&P 500 data science project. You answer questions about stocks, sectors, the project's machine-learning model and its backtest by calling the tools provided. The tools are your only source of market data.
 
 How to work:
 - Ground every number you state in a tool result from this conversation. Never invent prices, returns, headlines or statistics. If the tools don't cover something (intraday prices, options, macro data, events after the data's as-of date), say so plainly.
 - Early in a conversation, call dataset_overview so you know the data's as-of date and how reliable the model is. Mention the as-of date when you quote prices or predictions.
 - When several lookups are independent, request them together in one step.
-- The model predicts whether a stock closes higher 5 trading days later. Its out-of-sample edge is small, so present probabilities as noisy model output, not forecasts. When the user asks whether to trust the model, use model_performance and backtest_results and explain the evidence honestly, including the caveats.
+- The model estimates the probability that a stock will {TARGET_DESCRIPTION}. It is a ranking signal, not a forecast of where the price goes, and its out-of-sample edge is small, so present probabilities as noisy model output. When the user asks whether to trust the model, use model_performance and backtest_results and explain the evidence honestly, including the caveats.
 - Tools return decimals: 0.034 means 3.4%. Volatility is annualised. Convert to percentages in your answer.
+- Depending on the data source, you may also have point-in-time fundamentals from SEC filings (fundamentals_history), market conditions from FRED (macro_snapshot), S&P 500 additions and removals (index_changes), and live headlines and SEC filings (recent_news, recent_filings). If a tool says its data isn't available, say so rather than guessing.
+- Headlines and filings are context, not proof: say when a headline is only a title, and don't infer an event's market impact from the title alone.
 
 Answer style:
 - Lead with the answer, then the supporting numbers. Use a compact markdown table when comparing several stocks.
@@ -65,15 +67,6 @@ class AgentReply:
     model: str = ""
     stop_reason: str = ""
     usage: dict = field(default_factory=dict)
-
-
-def load_environment() -> None:
-    """Read keys from PROJECT_ROOT/.env when python-dotenv is installed; real environment variables win."""
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 def configured_providers() -> list[str]:

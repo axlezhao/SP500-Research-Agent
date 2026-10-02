@@ -15,7 +15,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_
 from sklearn.pipeline import Pipeline
 
 from .config import HORIZON_DAYS
-from .model import MODEL_FACTORIES, TARGET, available_features, fit_model, sample_rows
+from .model import MODEL_FACTORIES, TARGET, available_features, fit_model, investable, sample_rows
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class WalkForwardResult:
     model_name: str
     predictions: pd.DataFrame  # date, ticker, fold, probability, target and forward returns
     fold_metrics: pd.DataFrame
+    columns: list[str] = field(default_factory=list)
     last_pipeline: Pipeline | None = None
     last_test: pd.DataFrame | None = field(default=None, repr=False)
 
@@ -54,21 +55,23 @@ def walk_forward_folds(dates, n_splits: int = 5, min_train_fraction: float = 0.5
 
 
 def information_coefficients(df: pd.DataFrame, score_col: str, return_col: str = "future_return_5d", min_names: int = 5) -> pd.Series:
-    """Per-date Spearman rank correlation between a score and the forward return (the quant 'IC')."""
+    """Per-date Spearman rank correlation between a score and the forward return (the quant 'IC').
+
+    Computed with grouped sums rather than a Python call per date, which matters with thousands of dates.
+    """
     df = df.dropna(subset=[score_col, return_col])
     df = df[df.groupby("date")["ticker"].transform("count") >= min_names]
     if df.empty:
         return pd.Series(dtype=float)
     ranks = df[[score_col, return_col]].groupby(df["date"]).rank()
-    ranks["date"] = df["date"]
-    return ranks.groupby("date").apply(_rank_corr, score_col, return_col).dropna()
-
-
-def _rank_corr(group: pd.DataFrame, score_col: str, return_col: str) -> float:
-    # A score that is identical for every stock on a date (e.g. no news anywhere) carries no ranking.
-    if group[score_col].nunique() < 2 or group[return_col].nunique() < 2:
-        return float("nan")
-    return group[score_col].corr(group[return_col])
+    x, y, date = ranks[score_col], ranks[return_col], df["date"]
+    stats = pd.DataFrame({"x": x, "y": y, "xy": x * y, "xx": x * x, "yy": y * y, "date": date}).groupby("date").mean()
+    cov = stats["xy"] - stats["x"] * stats["y"]
+    var_x = stats["xx"] - stats["x"] ** 2
+    var_y = stats["yy"] - stats["y"] ** 2
+    # A score identical for every stock on a date (e.g. no news anywhere) carries no ranking: leave it out.
+    valid = (var_x > 1e-12) & (var_y > 1e-12)
+    return (cov[valid] / np.sqrt(var_x[valid] * var_y[valid])).rename(None)
 
 
 def ic_summary(ic: pd.Series, step: int = HORIZON_DAYS) -> dict:
@@ -113,10 +116,10 @@ def _fold_metrics(fold: Fold, train: pd.DataFrame, test: pd.DataFrame, probabili
 
 
 def walk_forward(features: pd.DataFrame, model_name: str, n_splits: int = 5, max_rows: int = 150_000) -> WalkForwardResult:
-    labelled = features.dropna(subset=[TARGET])
+    labelled = investable(features).dropna(subset=[TARGET])
     numeric, categorical = available_features(labelled)
     columns = numeric + categorical
-    keep = ["date", "ticker", TARGET, "future_return_5d", "tradable_return_5d"]
+    keep = ["date", "ticker", "sector", TARGET, "future_return_5d", "tradable_return_5d"]
     predictions, metrics = [], []
     pipeline, test = None, None
     for fold in walk_forward_folds(labelled["date"], n_splits=n_splits):
@@ -130,6 +133,7 @@ def walk_forward(features: pd.DataFrame, model_name: str, n_splits: int = 5, max
         model_name=model_name,
         predictions=pd.concat(predictions, ignore_index=True),
         fold_metrics=pd.DataFrame(metrics),
+        columns=columns,
         last_pipeline=pipeline,
         last_test=test,
     )
@@ -161,11 +165,11 @@ def compare_models(
 
 
 def calibration_table(predictions: pd.DataFrame, bins: int = 10) -> pd.DataFrame:
-    """Do predicted probabilities match how often stocks actually went up?"""
+    """Do predicted probabilities match how often the predicted event actually happened?"""
     df = predictions.dropna(subset=["probability", TARGET])
     df = df.assign(bucket=pd.qcut(df["probability"].rank(method="first"), q=min(bins, len(df)), labels=False))
     table = df.groupby("bucket").agg(
-        mean_predicted=("probability", "mean"), actual_up_rate=(TARGET, "mean"), rows=(TARGET, "size")
+        mean_predicted=("probability", "mean"), actual_rate=(TARGET, "mean"), rows=(TARGET, "size")
     )
     return table.reset_index(drop=True).rename_axis("bucket").reset_index().assign(bucket=lambda t: t["bucket"] + 1)
 
@@ -175,8 +179,7 @@ def feature_importance(result: WalkForwardResult, max_rows: int = 20_000, n_repe
     if result.last_pipeline is None or result.last_test is None or result.last_test[TARGET].nunique() < 2:
         return pd.DataFrame(columns=["feature", "importance_mean", "importance_std"])
     test = sample_rows(result.last_test, max_rows)
-    numeric, categorical = available_features(test)
-    columns = numeric + categorical
+    columns = result.columns
     importance = permutation_importance(
         result.last_pipeline, test[columns], test[TARGET].astype(int), scoring="roc_auc", n_repeats=n_repeats, random_state=42, n_jobs=1
     )
@@ -192,6 +195,7 @@ def signal_report(features: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataF
 
     A model that cannot beat its best single input is not adding much.
     """
+    features = investable(features)
     window = features[(features["date"] >= predictions["date"].min()) & (features["date"] <= predictions["date"].max())]
     numeric, _ = available_features(window)
     rows = [{"signal": "model_probability", **ic_summary(information_coefficients(predictions, "probability"))}]

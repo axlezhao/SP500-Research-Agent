@@ -4,6 +4,10 @@ Every HORIZON_DAYS sessions the stocks are ranked by predicted probability. Thre
 tracked: long the top quantile, long-short (top minus bottom quantile), and an equal-weight
 benchmark of every stock. Positions are entered EXECUTION_LAG_DAYS after the signal and held for
 HORIZON_DAYS, so the next rebalance never overlaps the previous holding period.
+
+With a risk-free rate (annual, decimal, by date), Sharpe ratios of the long-only portfolio and the
+benchmark are computed on returns in excess of cash. The long-short portfolio is self-financing, so
+its Sharpe uses raw returns.
 """
 
 from __future__ import annotations
@@ -58,19 +62,20 @@ def max_drawdown(returns: pd.Series) -> float:
     return float((equity / equity.cummax() - 1).min()) if len(equity) else float("nan")
 
 
-def performance(returns: pd.Series, periods_per_year: float) -> dict:
+def performance(returns: pd.Series, periods_per_year: float, cash: pd.Series | None = None) -> dict:
     returns = returns.dropna()
     n = len(returns)
     if n == 0:
         return {}
     growth = float((1 + returns).prod())
-    std = returns.std()
+    excess = returns - cash.reindex(returns.index).fillna(0.0) if cash is not None else returns
+    std = excess.std()
     return {
         "periods": n,
         "total_return": growth - 1,
         "cagr": growth ** (periods_per_year / n) - 1 if growth > 0 else -1.0,
         "ann_volatility": std * np.sqrt(periods_per_year) if n > 1 else float("nan"),
-        "sharpe": returns.mean() / std * np.sqrt(periods_per_year) if n > 1 and std > 0 else float("nan"),
+        "sharpe": excess.mean() / std * np.sqrt(periods_per_year) if n > 1 and std > 0 else float("nan"),
         "max_drawdown": max_drawdown(returns),
         "hit_rate": float((returns > 0).mean()),
     }
@@ -92,7 +97,7 @@ def quantile_returns(predictions: pd.DataFrame, rebalance_dates, config: Backtes
     )
 
 
-def run_backtest(predictions: pd.DataFrame, config: BacktestConfig | None = None) -> BacktestResult:
+def run_backtest(predictions: pd.DataFrame, config: BacktestConfig | None = None, risk_free: pd.Series | None = None) -> BacktestResult:
     config = config or BacktestConfig()
     usable = predictions.dropna(subset=[config.score_col, config.return_col])
     dates = np.sort(usable["date"].unique())
@@ -123,11 +128,17 @@ def run_backtest(predictions: pd.DataFrame, config: BacktestConfig | None = None
     ic = information_coefficients(usable[usable["date"].isin(rebalance_dates)], config.score_col, config.return_col, config.min_names)
     returns["ic"] = returns["date"].map(ic)
     returns["active"] = returns["long_only"] - returns["benchmark"]
+    if risk_free is not None and not risk_free.dropna().empty:
+        rate = risk_free.dropna().sort_index()
+        rate_frame = rate.rename("rate").rename_axis("date").reset_index().astype({"date": "datetime64[ns]"})
+        annual = pd.merge_asof(returns[["date"]].astype({"date": "datetime64[ns]"}), rate_frame, on="date", direction="backward")["rate"]
+        returns["cash"] = (annual.fillna(0.0) * config.holding_days / TRADING_DAYS_PER_YEAR).values
 
     periods_per_year = TRADING_DAYS_PER_YEAR / config.holding_days
     summary_rows = []
     for name in STRATEGIES:
-        stats = performance(returns[name], periods_per_year)
+        cash = returns["cash"] if "cash" in returns.columns and name != "long_short" else None
+        stats = performance(returns[name], periods_per_year, cash)
         stats.update(strategy=name, avg_turnover=returns[f"{name}_turnover"].iloc[1:].mean(), gross_total_return=float((1 + returns[f"{name}_gross"]).prod() - 1))
         summary_rows.append(stats)
     summary = pd.DataFrame(summary_rows).set_index("strategy")

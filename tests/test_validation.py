@@ -64,4 +64,4 @@ def test_calibration_buckets_are_sorted_by_prediction():
     assert len(table) == 10 and table["rows"].sum() == 1000
     assert table["mean_predicted"].is_monotonic_increasing
     # Well-calibrated synthetic data: actual rate tracks prediction.
-    assert np.corrcoef(table["mean_predicted"], table["actual_up_rate"])[0, 1] > 0.9
+    assert np.corrcoef(table["mean_predicted"], table["actual_rate"])[0, 1] > 0.9

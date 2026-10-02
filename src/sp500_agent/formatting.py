@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-CONSTRUCTIVE_THRESHOLD = 0.60
-CAUTIOUS_THRESHOLD = 0.40
+# The model's probabilities are mainly useful as a ranking, so the stance follows the stock's rank:
+# top fifth of the ranked stocks -> constructive, bottom fifth -> cautious.
+STANCE_QUANTILE = 0.2
 COMPANY_NAME_COLUMNS = ["displayname", "longname", "shortname", "company_name"]
 
 
@@ -40,10 +41,12 @@ def fmt_num(value, decimals: int = 2) -> str:
     return "n/a" if _missing(value) else f"{float(value):.{decimals}f}"
 
 
-def stance(probability: float) -> str:
-    if probability >= CONSTRUCTIVE_THRESHOLD:
+def stance(rank: int, total: int) -> str:
+    if total <= 0:
+        return "neutral"
+    if rank <= max(1, round(total * STANCE_QUANTILE)):
         return "constructive"
-    if probability <= CAUTIOUS_THRESHOLD:
+    if rank > total - max(1, round(total * STANCE_QUANTILE)):
         return "cautious"
     return "neutral"
 

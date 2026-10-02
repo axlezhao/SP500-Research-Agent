@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .agent import brief_markdown
+from .config import TARGET_DESCRIPTION
 from .formatting import COMPANY_NAME_COLUMNS, company_label, fmt_pct, fmt_prob
 
 POPULAR_ALIASES = {
@@ -110,9 +111,9 @@ def find_ticker(message: str, scored: pd.DataFrame) -> str | None:
 
 
 def ranking_answer(scored: pd.DataFrame, n: int = 10, ascending: bool = False) -> ChatAnswer:
-    ranked = scored.sort_values("up_probability_5d", ascending=ascending).head(n).copy()
+    ranked = scored.sort_values("model_probability", ascending=ascending).head(n).copy()
     ranked["company"] = ranked.apply(company_label, axis=1)
-    ranked["model_probability"] = ranked["up_probability_5d"].map(fmt_prob)
+    ranked["model_probability"] = ranked["model_probability"].map(fmt_prob)
     ranked["5d_return"] = ranked["return_5d"].map(fmt_pct)
     ranked["20d_return"] = ranked["return_20d"].map(fmt_pct)
     ranked["volatility_ann"] = ranked["volatility_20d"].map(fmt_pct)
@@ -121,7 +122,7 @@ def ranking_answer(scored: pd.DataFrame, n: int = 10, ascending: bool = False) -
     table = ranked[["rank", "ticker", "company", "sector", "model_probability", "5d_return", "20d_return", "volatility_ann"]]
     direction = "lowest" if ascending else "highest"
     text = (
-        f"Here are the {len(table)} stocks with the {direction} model-ranked 5-day upward-move probability. "
+        f"Here are the {len(table)} stocks with the {direction} model probability to {TARGET_DESCRIPTION}. "
         "This is a research signal, not a buy or sell recommendation."
     )
     return ChatAnswer(text, table=table)

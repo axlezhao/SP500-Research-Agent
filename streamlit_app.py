@@ -106,7 +106,7 @@ def render_message(message: dict) -> None:
         if not match.empty:
             row = match.iloc[0]
             cols = st.columns(4)
-            cols[0].metric("Model probability", fmt_prob(row["up_probability_5d"]))
+            cols[0].metric("Model probability", fmt_prob(row["model_probability"]))
             cols[1].metric("Rank", f"{int(row['rank'])}/{len(data.scored)}")
             cols[2].metric("20D return", fmt_pct(row.get("return_20d")))
             cols[3].metric("Volatility (ann.)", fmt_pct(row.get("volatility_20d")))
@@ -136,7 +136,8 @@ with st.sidebar:
     cols = st.columns(2)
     cols[0].metric("Stocks", f"{len(data.scored):,}")
     cols[1].metric("Walk-forward AUC", f"{metrics['auc_mean']:.3f}" if "auc_mean" in metrics else "n/a", help="Out-of-sample. 0.500 means no skill.")
-    st.caption(f"Model: {data.bundle.get('model_name', 'n/a')}")
+    source_label = {"live": "Live public data", "kaggle": "Kaggle dataset", "sample": "Synthetic sample"}.get(data.source, data.source)
+    st.caption(f"Data: {source_label} · Model: {data.bundle.get('model_name', 'n/a')}")
     st.divider()
 
     st.subheader("Assistant")
@@ -274,26 +275,70 @@ with model_tab:
             st.download_button("Download the full research report (Markdown)", artifacts["report"], file_name="research_report.md", mime="text/markdown")
 
 with data_tab:
+    quality = data.quality
+    if quality:
+        st.markdown("**Data sources and quality**")
+        prices_q = quality.get("prices", {})
+        sources = [{"Source": "Yahoo Finance", "Provides": "Daily prices", "Coverage": f"{prices_q.get('tickers', 'n/a')} stocks, {prices_q.get('start')} to {prices_q.get('end')}"}]
+        if "membership" in quality:
+            m = quality["membership"]
+            sources.append({"Source": "Wikipedia", "Provides": "Index membership", "Coverage": f"{m['tickers_ever_in_index']} stocks ever in the index; {m['unresolved_changes']} of {m['changes_used']} changes unresolved"})
+        if "fundamentals" in quality:
+            f = quality["fundamentals"]
+            sources.append({"Source": "SEC EDGAR", "Provides": "Point-in-time fundamentals", "Coverage": f"{f['tickers_with_data']} stocks ({fmt_pct(f['share_of_priced_tickers'])}); median {f['median_days_since_last_filing']} days since last filing"})
+        if "macro" in quality:
+            sources.append({"Source": "FRED", "Provides": "VIX, Treasury yields", "Coverage": "through " + max(quality["macro"].values())})
+        fetched = quality.get("fetched_at", {})
+        for row in sources:
+            key = {"Yahoo Finance": "prices", "Wikipedia": "universe", "SEC EDGAR": "fundamentals", "FRED": "macro"}[row["Source"]]
+            row["Last fetched (UTC)"] = (fetched.get(key) or "")[:16].replace("T", " ") or "n/a"
+        st.dataframe(pd.DataFrame(sources), width="stretch", hide_index=True)
+        notes = []
+        if "survivorship" in quality:
+            s = quality["survivorship"]
+            notes.append(
+                f"Survivorship: {s['former_members_with_prices']} of {s['former_members']} former index members have usable prices "
+                f"({s.get('dropped_no_matching_history', 0)} dropped because the symbol's history doesn't match their membership, e.g. a reused ticker)."
+            )
+        if prices_q.get("extreme_daily_moves"):
+            examples = ", ".join(f"{e['ticker']} {e['move']:+.0%} on {e['date']}" for e in prices_q.get("extreme_examples", [])[:3])
+            notes.append(f"{prices_q['extreme_daily_moves']} daily moves above 40% (largest: {examples}). Most are real events; some are corporate actions the price source hasn't adjusted.")
+        for note in notes:
+            st.caption(note)
+
+    if data.macro is not None and not data.macro.empty:
+        st.markdown("**Market conditions** (FRED)")
+        recent_macro = data.macro[data.macro["date"] >= data.macro["date"].max() - pd.Timedelta(days=5 * 365)]
+        left, right = st.columns(2)
+        with left:
+            st.altair_chart(charts.series_chart(recent_macro, "vix", "VIX", ".1f", chart_mode()), width="stretch")
+        with right:
+            st.altair_chart(charts.series_chart(recent_macro, "term_spread", "10y minus 3m yield (pts)", ".2f", chart_mode(), reference=0.0), width="stretch")
+        st.caption("Below the dashed line the yield curve is inverted, which has often preceded recessions.")
+
     eda = artifacts.get("eda")
     if eda:
         cols = st.columns(4)
-        cols[0].metric("Rows", f"{eda['rows']:,}")
+        cols[0].metric("Rows", f"{eda['rows'] / 1e6:.2f}M" if eda["rows"] >= 1e6 else f"{eda['rows']:,}")
         cols[1].metric("Stocks", f"{eda['tickers']:,}")
         cols[2].metric("Trading days", f"{eda['trading_days']:,}")
-        cols[3].metric("5-day up rate", fmt_pct(eda["up_rate_5d"]), help="The bar a classifier has to beat.")
+        cols[3].metric("Target base rate", fmt_pct(eda.get("target_rate", eda["up_rate_5d"])), help=f"How often the predicted event happens: {eda.get('target', 'close higher in 5 days')}.")
         fr = eda["forward_return_5d"]
         st.caption(
             f"{eda['start']} to {eda['end']}. 5-day forward returns: mean {fmt_pct(fr['mean'])}, std {fmt_pct(fr['std'])}, skew {fr['skew']:.2f}, "
-            f"excess kurtosis {fr['excess_kurtosis']:.2f}. Rows with recent news: {fmt_pct(eda['share_of_rows_with_recent_news'])}."
+            f"excess kurtosis {fr['excess_kurtosis']:.2f}."
+            + (f" Rows with recent news: {fmt_pct(eda['share_of_rows_with_recent_news'])}." if eda.get("share_of_rows_with_recent_news") else "")
         )
     st.markdown("**Screener** (latest date)")
+    for ticker, reason in data.excluded.items():
+        st.caption(f"{ticker} is left out of the ranking: {reason}.")
     screen = data.scored.copy()
     screen["company"] = screen.apply(company_label, axis=1)
     sectors = sorted(screen["sector"].dropna().unique()) if "sector" in screen else []
     chosen = st.multiselect("Sectors", sectors, placeholder="All sectors")
     if chosen:
         screen = screen[screen["sector"].isin(chosen)]
-    columns = [c for c in ["rank", "ticker", "company", "sector", "up_probability_5d", "return_5d", "return_20d", "momentum_60d", "volatility_20d", "sentiment_20d", "market_cap", "pe_ratio"] if c in screen.columns]
+    columns = [c for c in ["rank", "ticker", "company", "sector", "model_probability", "return_5d", "return_20d", "momentum_60d", "volatility_20d", "sentiment_20d", "market_cap", "pe_ratio"] if c in screen.columns]
     st.dataframe(
         screen[columns],
         width="stretch",
@@ -303,7 +348,7 @@ with data_tab:
             "ticker": "Ticker",
             "company": "Company",
             "sector": "Sector",
-            "up_probability_5d": st.column_config.ProgressColumn("Model probability", min_value=0.0, max_value=1.0, format="percent"),
+            "model_probability": st.column_config.ProgressColumn("Model probability", min_value=0.0, max_value=1.0, format="percent"),
             "return_5d": st.column_config.NumberColumn("5D return", format="percent"),
             "return_20d": st.column_config.NumberColumn("20D return", format="percent"),
             "momentum_60d": st.column_config.NumberColumn("60D momentum", format="percent"),

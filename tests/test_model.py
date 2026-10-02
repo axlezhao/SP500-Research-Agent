@@ -30,4 +30,4 @@ def test_score_latest_skips_stale_tickers_and_ranks(sample_features):
     assert "XOM" not in set(scored["ticker"])
     assert (scored["date"] == sample_features["date"].max()).all()
     assert scored["rank"].tolist() == list(range(1, len(scored) + 1))
-    assert scored["up_probability_5d"].is_monotonic_decreasing
+    assert scored["model_probability"].is_monotonic_decreasing

@@ -107,19 +107,35 @@ def importance_chart(importance: pd.DataFrame, top: int = 12, mode: str = "light
 
 
 def calibration_chart(calibration: pd.DataFrame, mode: str = "light") -> alt.Chart:
-    """Predicted probability vs. how often stocks actually rose; perfect calibration sits on the diagonal."""
-    low = float(min(calibration["mean_predicted"].min(), calibration["actual_up_rate"].min()))
-    high = float(max(calibration["mean_predicted"].max(), calibration["actual_up_rate"].max()))
+    """Predicted probability vs. how often the event happened; perfect calibration sits on the diagonal."""
+    low = float(min(calibration["mean_predicted"].min(), calibration["actual_rate"].min()))
+    high = float(max(calibration["mean_predicted"].max(), calibration["actual_rate"].max()))
     pad = (high - low) * 0.1 or 0.05
     domain = [max(0.0, low - pad), min(1.0, high + pad)]
     diagonal = alt.Chart(pd.DataFrame({"x": domain, "y": domain})).mark_line(color=_colors(mode)["muted"], strokeDash=[4, 4]).encode(x="x:Q", y="y:Q")
     points = alt.Chart(calibration).mark_line(color=_colors(mode)["series"][0], strokeWidth=2, point=alt.OverlayMarkDef(size=64, filled=True)).encode(
         x=alt.X("mean_predicted:Q", title="Mean predicted probability", scale=alt.Scale(domain=domain), axis=alt.Axis(format=".0%")),
-        y=alt.Y("actual_up_rate:Q", title="Share that actually rose", scale=alt.Scale(domain=domain), axis=alt.Axis(format=".0%")),
+        y=alt.Y("actual_rate:Q", title="Share where it happened", scale=alt.Scale(domain=domain), axis=alt.Axis(format=".0%")),
         tooltip=[alt.Tooltip("bucket:O", title="Decile"), alt.Tooltip("mean_predicted:Q", title="Predicted", format=".1%"),
-                 alt.Tooltip("actual_up_rate:Q", title="Actual", format=".1%"), alt.Tooltip("rows:Q", title="Rows")],
+                 alt.Tooltip("actual_rate:Q", title="Actual", format=".1%"), alt.Tooltip("rows:Q", title="Rows")],
     )
     return alt.layer(diagonal, points).properties(height=HEIGHT)
+
+
+def series_chart(frame: pd.DataFrame, column: str, title: str, value_format: str, mode: str = "light", reference: float | None = None, height: int = 220) -> alt.Chart:
+    """One time series with a hover tooltip and an optional dashed reference line (e.g. zero)."""
+    df = frame[["date", column]].dropna()
+    hover = alt.selection_point(fields=["date"], nearest=True, on="pointerover", empty=False, clear="pointerout")
+    base = alt.Chart(df).encode(x=alt.X("date:T", title=None))
+    line = base.mark_line(color=_colors(mode)["series"][0], strokeWidth=2).encode(y=alt.Y(f"{column}:Q", title=title, scale=alt.Scale(zero=False)))
+    rule = base.mark_rule(color=_colors(mode)["muted"]).encode(
+        opacity=alt.condition(hover, alt.value(1), alt.value(0)),
+        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip(f"{column}:Q", title=title, format=value_format)],
+    ).add_params(hover)
+    layers = [line, rule]
+    if reference is not None:
+        layers.insert(0, alt.Chart(pd.DataFrame({"y": [reference]})).mark_rule(color=_colors(mode)["muted"], strokeDash=[4, 4]).encode(y="y:Q"))
+    return alt.layer(*layers).properties(height=height)
 
 
 def price_chart(history: pd.DataFrame, ticker: str, mode: str = "light") -> alt.Chart:

@@ -13,7 +13,7 @@ def scored():
         {
             "ticker": TICKERS,
             "company_name": [f"{t} Corp" for t in TICKERS],
-            "up_probability_5d": [0.9 - i * 0.05 for i in range(n)],
+            "model_probability": [0.9 - i * 0.05 for i in range(n)],
             "rank": range(1, n + 1),
             "date": pd.Timestamp("2024-12-30"),
             "close": 100.0,

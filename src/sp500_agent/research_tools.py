@@ -7,6 +7,7 @@ are tested directly.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -14,8 +15,8 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
-from .config import TRADING_DAYS_PER_YEAR
-from .features import SNAPSHOT_FIELDS, load_features, load_news_headlines
+from .config import PROCESSED_DIR, TARGET_DESCRIPTION, TRADING_DAYS_PER_YEAR, load_environment
+from .features import SNAPSHOT_FIELDS, _lexicon_sentiment, load_features, load_news_headlines
 from .formatting import COMPANY_NAME_COLUMNS, company_label, stance
 from .model import load_model, score_latest
 from .research import load_artifacts
@@ -31,8 +32,9 @@ SIGNAL_FIELDS = [
     "news_count_20d",
     "return_20d_vs_sector",
 ]
-SORTABLE_FIELDS = ["up_probability_5d", "return_5d", "return_20d", "momentum_60d", "volatility_20d", "ma_gap_50d", "sentiment_20d", "market_cap", "pe_ratio"]
+SORTABLE_FIELDS = ["model_probability", "return_5d", "return_20d", "momentum_60d", "volatility_20d", "ma_gap_50d", "sentiment_20d", "market_cap", "pe_ratio"]
 MAX_ROWS = 25
+SUSPECT_DAILY_MOVE = 0.4
 MAX_COMPARE = 8
 CHART_POINTS = 60
 
@@ -68,14 +70,53 @@ class ResearchData:
     bundle: dict
     news: pd.DataFrame = field(default_factory=pd.DataFrame)
     artifacts: dict = field(default_factory=dict)
+    fundamentals: pd.DataFrame | None = None  # point-in-time SEC data (live source only)
+    macro: pd.DataFrame | None = None
+    membership: pd.DataFrame | None = None
+    index_changes: pd.DataFrame | None = None
+    companies: pd.DataFrame | None = None
+    quality: dict = field(default_factory=dict)
+    news_fetcher: object | None = None  # fetches current headlines on demand (sources.news.NewsFetcher)
+    filings_fetcher: object | None = None  # fetches recent SEC filings on demand (sources.sec.FilingsFetcher)
     scored: pd.DataFrame = field(init=False)
 
     def __post_init__(self) -> None:
         self.scored = score_latest(self.features, self.bundle)
+        self.excluded: dict[str, str] = dict(self.scored.attrs.get("excluded", {}))
+
+    @property
+    def source(self) -> str:
+        return self.quality.get("source", "unknown")
 
     @classmethod
-    def load(cls) -> "ResearchData":
-        return cls(load_features(), load_model(), load_news_headlines(), load_artifacts())
+    def load(cls, directory=PROCESSED_DIR, live_fetchers: bool = True) -> "ResearchData":
+        def optional(name):
+            path = directory / f"{name}.parquet"
+            return pd.read_parquet(path) if path.exists() else None
+
+        quality_path = directory / "data_quality.json"
+        data = cls(
+            load_features(),
+            load_model(),
+            load_news_headlines(),
+            load_artifacts(),
+            fundamentals=optional("fundamentals"),
+            macro=optional("macro"),
+            membership=optional("membership"),
+            index_changes=optional("index_changes"),
+            companies=optional("companies"),
+            quality=json.loads(quality_path.read_text()) if quality_path.exists() else {},
+        )
+        if live_fetchers and data.source == "live":
+            from .sources.news import NewsFetcher
+            from .sources.sec import FilingsFetcher
+
+            load_environment()
+            data.news_fetcher = NewsFetcher()
+            if data.companies is not None and "cik" in data.companies:
+                ciks = {t: int(c) for t, c in zip(data.companies["ticker"], data.companies["cik"]) if pd.notna(c)}
+                data.filings_fetcher = FilingsFetcher.from_env(ciks)
+        return data
 
 
 TOOL_DEFINITIONS = [
@@ -99,7 +140,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "stock_snapshot",
-        "description": "Everything known about one stock on the latest date: model probability of a 5-day rise, its rank, price and momentum signals, volatility, news sentiment, and a fundamentals snapshot (market cap, P/E, margins).",
+        "description": "Everything known about one stock on the latest date: the model's probability and rank, price and momentum signals, volatility, news sentiment, and a fundamentals snapshot (market cap, P/E, margins).",
         "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string", "description": "Ticker symbol, e.g. AAPL."}},
@@ -109,7 +150,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "rank_stocks",
-        "description": "Stocks with the highest ('top') or lowest ('bottom') model probability of rising over the next 5 trading days, optionally within one sector.",
+        "description": f"Stocks with the highest ('top') or lowest ('bottom') model probability to {TARGET_DESCRIPTION}, optionally within one sector.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -131,7 +172,7 @@ TOOL_DEFINITIONS = [
                 "max_volatility": {"type": "number", "description": "Maximum annualised volatility, e.g. 0.35."},
                 "min_momentum_60d": {"type": "number", "description": "Minimum 60-day return, e.g. 0.1 for +10%."},
                 "max_pe_ratio": {"type": "number"},
-                "sort_by": {"type": "string", "enum": SORTABLE_FIELDS, "description": "Default up_probability_5d."},
+                "sort_by": {"type": "string", "enum": SORTABLE_FIELDS, "description": "Default model_probability."},
                 "ascending": {"type": "boolean", "description": "Sort ascending. Default false."},
                 "limit": {"type": "integer", "description": "Maximum rows (1-25). Default 15."},
             },
@@ -163,7 +204,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "recent_news",
-        "description": "Most recent news headlines for a stock with their sentiment scores (-1 negative to +1 positive).",
+        "description": "Most recent news headlines for a stock with a simple word-list sentiment score (-1 negative to +1 positive). With live data the headlines are fetched now; otherwise they come from the dataset.",
         "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "description": "1-20. Default 8."}},
@@ -175,6 +216,44 @@ TOOL_DEFINITIONS = [
         "name": "sector_summary",
         "description": "Per-sector averages on the latest date: number of stocks, mean model probability, mean 20-day return and volatility, and the highest-ranked stock in each sector.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "fundamentals_history",
+        "description": "Point-in-time fundamentals from SEC filings for one stock: trailing-12-month revenue and net income, revenue growth, equity, liabilities and shares, each with the date it became public. Use for questions about growth, profitability or balance sheets over time.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"ticker": {"type": "string"}, "quarters": {"type": "integer", "description": "How many recent filings (1-20). Default 8."}},
+            "required": ["ticker"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "macro_snapshot",
+        "description": "Current market conditions from FRED: VIX (expected volatility), 3-month T-bill and 10-year Treasury yields, and the yield-curve spread, compared with a year ago and with their 10-year history.",
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "index_changes",
+        "description": "S&P 500 additions and removals. With a ticker: when it joined or left the index. Without: the most recent changes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"ticker": {"type": "string"}, "limit": {"type": "integer", "description": "1-25. Default 10."}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "recent_filings",
+        "description": "A company's most recent SEC filings (10-K annual reports, 10-Q quarterly reports, 8-K current reports such as earnings releases or leadership changes) with dates and links. Fetched live from SEC EDGAR.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "form": {"type": "string", "enum": ["10-K", "10-Q", "8-K"], "description": "Only this form type. Default: all three."},
+                "limit": {"type": "integer", "description": "1-20. Default 8."},
+            },
+            "required": ["ticker"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "model_performance",
@@ -232,6 +311,22 @@ class ResearchToolkit:
         return to_json_safe(getattr(self, name)(**arguments))
 
     # -- helpers --------------------------------------------------------------------------------
+    def _symbol(self, ticker: str) -> str:
+        """Any ticker with data (ranked or not), for history, news, filings and fundamentals lookups."""
+        symbol = str(ticker).strip().upper().lstrip("$").replace("-", ".")
+        if symbol in self._by_ticker.index or symbol in self.data.excluded:
+            return symbol
+        known = self._known_tickers()
+        for candidate in (symbol, symbol.replace(".", "-")):
+            if candidate in known:
+                return candidate
+        return self._row(ticker)["ticker"]  # raises with suggestions
+
+    def _known_tickers(self) -> set:
+        if not hasattr(self, "_known"):
+            self._known = set(self.data.features["ticker"].unique())
+        return self._known
+
     def _row(self, ticker: str) -> pd.Series:
         symbol = str(ticker).strip().upper().lstrip("$").replace("-", ".")
         if symbol in self._by_ticker.index:
@@ -239,6 +334,11 @@ class ResearchToolkit:
         alternative = symbol.replace(".", "-")
         if alternative in self._by_ticker.index:
             return self._by_ticker.loc[alternative]
+        if symbol in self.data.excluded:
+            raise ToolInputError(
+                f"{symbol} is left out of today's ranking because of {self.data.excluded[symbol]}. "
+                "Its price history, news, filings and fundamentals are still available."
+            )
         suggestions = [m["ticker"] for m in self.search_companies(ticker, limit=5)["matches"]]
         hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else " Use search_companies to find the ticker."
         raise ToolInputError(f"{ticker!r} is not among the {len(self.scored)} ranked stocks.{hint}")
@@ -262,7 +362,7 @@ class ResearchToolkit:
             "company": company_label(row),
             "sector": row.get("sector"),
             "rank": row["rank"],
-            "up_probability_5d": row["up_probability_5d"],
+            "model_probability": row["model_probability"],
             "return_5d": row.get("return_5d"),
             "return_20d": row.get("return_20d"),
             "momentum_60d": row.get("momentum_60d"),
@@ -281,13 +381,29 @@ class ResearchToolkit:
             "sectors": sorted(self.scored["sector"].dropna().astype(str).unique()) if "sector" in self.scored else [],
             "model": bundle.get("model_name"),
             "model_trained_through": bundle.get("trained_through"),
-            "prediction_target": "probability that the stock's close is higher 5 trading days later",
+            "prediction_target": f"probability that the stock will {TARGET_DESCRIPTION}",
             "walk_forward_auc": metrics.get("auc_mean"),
             "walk_forward_ic_mean": metrics.get("ic_mean"),
             "accuracy": metrics.get("accuracy"),
             "baseline_accuracy": metrics.get("baseline_accuracy"),
+            "data_source": self.data.source,
+            "left_out_of_ranking": self.data.excluded,
+            "data_quality": self._quality_summary(),
+            "live_lookups": {
+                "news": getattr(self.data.news_fetcher, "source", None) or "dataset headlines only",
+                "sec_filings": "available" if self.data.filings_fetcher else "unavailable (set SEC_USER_AGENT and use live data)",
+            },
             "reading_guide": "AUC 0.5 = no skill. Daily stock direction is close to a coin flip; small edges are normal and fragile.",
         }
+
+    def _quality_summary(self) -> dict:
+        q = self.data.quality
+        out = {"price_tickers": q.get("prices", {}).get("tickers"), "price_end": q.get("prices", {}).get("end")}
+        if "survivorship" in q:
+            out["former_members_with_prices"] = f"{q['survivorship']['former_members_with_prices']} of {q['survivorship']['former_members']}"
+        if "fundamentals" in q:
+            out["tickers_with_sec_fundamentals"] = q["fundamentals"]["tickers_with_data"]
+        return out
 
     def search_companies(self, query: str, limit: int = 5) -> dict:
         limit = _int_arg({"limit": limit}, "limit", 5, 1, MAX_ROWS)
@@ -305,27 +421,46 @@ class ResearchToolkit:
         hits = self.scored[score > 0].assign(_score=score[score > 0]).sort_values(["_score", "rank"], ascending=[False, True])
         return {"query": query, "matches": [{"ticker": r["ticker"], "company": company_label(r), "sector": r.get("sector")} for _, r in hits.head(limit).iterrows()]}
 
+    def _data_warning(self, ticker: str) -> str | None:
+        """Flag a recent daily move so large it may be an unadjusted corporate action rather than a real return."""
+        recent = self.data.features[self.data.features["ticker"] == ticker].sort_values("date").tail(20)
+        moves = recent["return_1d"].abs() if "return_1d" in recent else pd.Series(dtype=float)
+        if moves.isna().all() or moves.max() <= SUSPECT_DAILY_MOVE:
+            return None
+        worst = recent.loc[moves.idxmax()]
+        return (
+            f"A daily move of {worst['return_1d']:+.0%} on {worst['date'].date()} may be a corporate action (spin-off, split, merger) "
+            "that the price source hasn't adjusted for yet. Treat recent returns and the model's view with caution."
+        )
+
     def stock_snapshot(self, ticker: str) -> dict:
         row = self._row(ticker)
         return {
+            "data_warning": self._data_warning(row["ticker"]),
             "ticker": row["ticker"],
             "company": company_label(row),
             "sector": row.get("sector"),
             "as_of_date": row["date"],
-            "up_probability_5d": row["up_probability_5d"],
-            "model_view": stance(float(row["up_probability_5d"])),
+            "model_probability": row["model_probability"],
+            "model_view": stance(int(row["rank"]), len(self.scored)),
             "rank": row["rank"],
             "out_of": len(self.scored),
             "signals": {col: row.get(col) for col in SIGNAL_FIELDS if col in row.index},
-            "fundamentals_snapshot": {col: row.get(col) for col in SNAPSHOT_FIELDS if col in row.index},
-            "notes": "Volatility is annualised. Returns are decimals. Fundamentals are the latest snapshot and are not model inputs.",
+            "fundamentals": {col: row.get(col) for col in SNAPSHOT_FIELDS if col in row.index and pd.notna(row.get(col))},
+            "fundamentals_as_of": row.get("fundamentals_as_of"),
+            "notes": "Volatility is annualised. Returns are decimals. "
+            + (
+                "Fundamentals are trailing-12-month figures from SEC filings public on fundamentals_as_of; their cross-sectional ranks are model inputs."
+                if "fundamentals_as_of" in row.index
+                else "Fundamentals are a single current snapshot and are not model inputs."
+            ),
         }
 
     def rank_stocks(self, n: int = 10, direction: str = "top", sector: str | None = None) -> dict:
         n = _int_arg({"n": n}, "n", 10, 1, MAX_ROWS)
         if direction not in ("top", "bottom"):
             raise ToolInputError("direction must be 'top' or 'bottom'.")
-        rows = self._sector_rows(sector).sort_values("up_probability_5d", ascending=direction == "bottom").head(n)
+        rows = self._sector_rows(sector).sort_values("model_probability", ascending=direction == "bottom").head(n)
         return {"direction": direction, "sector": sector, "as_of_date": self.scored["date"].max(), "stocks": [self._summary_row(r) for _, r in rows.iterrows()]}
 
     def screen_stocks(
@@ -335,14 +470,14 @@ class ResearchToolkit:
         max_volatility: float | None = None,
         min_momentum_60d: float | None = None,
         max_pe_ratio: float | None = None,
-        sort_by: str = "up_probability_5d",
+        sort_by: str = "model_probability",
         ascending: bool = False,
         limit: int = 15,
     ) -> dict:
         args = locals()
         rows = self._sector_rows(sector)
         for key, column, keep_if in [
-            ("min_probability", "up_probability_5d", lambda s, v: s >= v),
+            ("min_probability", "model_probability", lambda s, v: s >= v),
             ("max_volatility", "volatility_20d", lambda s, v: s <= v),
             ("min_momentum_60d", "momentum_60d", lambda s, v: s >= v),
             ("max_pe_ratio", "pe_ratio", lambda s, v: (s <= v) & (s > 0)),
@@ -370,7 +505,7 @@ class ResearchToolkit:
 
     def price_history(self, ticker: str, days: int = 252) -> dict:
         days = _int_arg({"days": days}, "days", 252, 20, 1260)
-        symbol = self._row(ticker)["ticker"]
+        symbol = self._symbol(ticker)
         history = self.data.features.loc[self.data.features["ticker"] == symbol, ["date", "close"]].sort_values("date").tail(days)
         close = history["close"].reset_index(drop=True)
         daily = close.pct_change().dropna()
@@ -394,13 +529,88 @@ class ResearchToolkit:
 
     def recent_news(self, ticker: str, limit: int = 8) -> dict:
         limit = _int_arg({"limit": limit}, "limit", 8, 1, 20)
-        symbol = self._row(ticker)["ticker"]
+        symbol = self._symbol(ticker)
+        if self.data.news_fetcher is not None:
+            live = self.data.news_fetcher.fetch(symbol).head(limit)
+            live = live.assign(sentiment_score=(live["title"].fillna("") + " " + live["summary"].fillna("")).map(_lexicon_sentiment))
+            return {"ticker": symbol, "fetched_from": self.data.news_fetcher.source, "headlines": live[["date", "title", "sentiment_score", "source", "url"]]}
         news = self.data.news
         if news is None or news.empty:
-            return {"ticker": symbol, "headlines": [], "note": "No news file is available. Re-run the pipeline to save headlines."}
+            return {"ticker": symbol, "headlines": [], "note": "No headlines in this dataset. Live news is available when the pipeline uses live data."}
         rows = news[news["ticker"] == symbol].sort_values("date", ascending=False).head(limit)
         keep = [c for c in ["date", "title", "sentiment_score", "source"] if c in rows.columns]
         return {"ticker": symbol, "headlines": rows[keep]}
+
+    def fundamentals_history(self, ticker: str, quarters: int = 8) -> dict:
+        quarters = _int_arg({"quarters": quarters}, "quarters", 8, 1, 20)
+        symbol = self._symbol(ticker)
+        table = self.data.fundamentals
+        if table is None or table.empty:
+            return {"ticker": symbol, "history": [], "note": "No point-in-time fundamentals in this dataset; they come from SEC EDGAR with the live data source."}
+        rows = table[table["ticker"] == symbol].sort_values("available_date").tail(quarters)
+        rows = rows.assign(profit_margin=(rows["net_income_ttm"] / rows["revenue_ttm"]).where(rows["revenue_ttm"] > 0))
+        columns = ["available_date", "period_end", "revenue_ttm", "net_income_ttm", "profit_margin", "revenue_growth_yoy", "equity", "liabilities", "shares_outstanding"]
+        return {
+            "ticker": symbol,
+            "history": rows[columns].iloc[::-1],
+            "notes": "available_date is when the filing became public; values are as first reported (no later restatements). _ttm = trailing twelve months.",
+        }
+
+    def macro_snapshot(self) -> dict:
+        macro = self.data.macro
+        if macro is None or macro.empty:
+            return {"note": "No macro data in this dataset; FRED series come with the live data source."}
+        macro = macro.sort_values("date").ffill()
+        latest = macro.iloc[-1]
+        year_ago = macro[macro["date"] <= latest["date"] - pd.Timedelta(days=365)].iloc[-1] if (macro["date"] <= latest["date"] - pd.Timedelta(days=365)).any() else None
+        decade = macro[macro["date"] >= latest["date"] - pd.Timedelta(days=3652)]
+        out = {"as_of": latest["date"], "series": {}}
+        for col, label in [("vix", "VIX"), ("tbill_3m", "3-month T-bill yield, %"), ("treasury_10y", "10-year Treasury yield, %"), ("term_spread", "10y minus 3m, percentage points")]:
+            if col in macro.columns:
+                out["series"][col] = {
+                    "label": label,
+                    "latest": latest[col],
+                    "one_year_ago": year_ago[col] if year_ago is not None else None,
+                    "percentile_10y": float((decade[col] <= latest[col]).mean()),
+                }
+        out["notes"] = "A negative term spread (inverted yield curve) has often preceded recessions. VIX above ~30 signals stressed markets."
+        return out
+
+    def index_changes(self, ticker: str | None = None, limit: int = 10) -> dict:
+        limit = _int_arg({"limit": limit}, "limit", 10, 1, MAX_ROWS)
+        changes = self.data.index_changes
+        if changes is None or changes.empty:
+            return {"note": "No index-membership data in this dataset; it comes from Wikipedia with the live data source."}
+        columns = ["date", "added", "added_name", "removed", "removed_name", "reason"]
+        if not ticker:
+            return {"recent_changes": changes.sort_values("date", ascending=False).head(limit)[columns]}
+        symbol = str(ticker).strip().upper().replace("-", ".")
+        involved = changes[(changes["added"] == symbol) | (changes["removed"] == symbol)].sort_values("date", ascending=False)
+        intervals = self.data.membership[self.data.membership["ticker"] == symbol] if self.data.membership is not None else pd.DataFrame()
+        return {
+            "ticker": symbol,
+            "currently_in_index": bool((intervals["end"].isna()).any()) if not intervals.empty else False,
+            "membership_periods": [{"from": r.start, "to": r.end} for r in intervals.itertuples()],
+            "changes": involved.head(limit)[columns],
+            "note": "A missing 'from' date means the stock was already a member when the reconstructed history begins.",
+        }
+
+    def recent_filings(self, ticker: str, form: str | None = None, limit: int = 8) -> dict:
+        limit = _int_arg({"limit": limit}, "limit", 8, 1, 20)
+        symbol = self._symbol(ticker)
+        if self.data.filings_fetcher is None:
+            return {"ticker": symbol, "filings": [], "note": "SEC filings lookups need the live data source and SEC_USER_AGENT in .env."}
+        if form is not None and form not in ("10-K", "10-Q", "8-K"):
+            raise ToolInputError("form must be one of 10-K, 10-Q, 8-K.")
+        try:
+            filings = self.data.filings_fetcher.fetch(symbol, forms=(form,) if form else ("10-K", "10-Q", "8-K"))
+        except KeyError as exc:
+            raise ToolInputError(f"No SEC CIK is known for {symbol}.") from exc
+        return {
+            "ticker": symbol,
+            "filings": filings.head(limit)[["form", "filed", "report_date", "items", "url"]],
+            "notes": "8-K 'items' codes: 2.02 results of operations (earnings), 5.02 executive or director changes, 1.01 material agreements, 8.01 other events.",
+        }
 
     def sector_summary(self) -> dict:
         if "sector" not in self.scored.columns:
@@ -408,7 +618,7 @@ class ResearchToolkit:
         grouped = self.scored.groupby("sector")
         table = grouped.agg(
             stocks=("ticker", "count"),
-            mean_up_probability=("up_probability_5d", "mean"),
+            mean_up_probability=("model_probability", "mean"),
             mean_return_20d=("return_20d", "mean"),
             mean_volatility=("volatility_20d", "mean"),
         )

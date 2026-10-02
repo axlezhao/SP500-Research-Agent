@@ -13,7 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from .config import MODEL_PATH
+from .config import HORIZON_DAYS, MODEL_PATH, TARGET_COLUMNS, TARGET_MODE
 
 
 # Only features that were known on each row's date. Snapshot fundamentals are excluded
@@ -31,11 +31,28 @@ NUMERIC_FEATURES = [
     "momentum_60d_xs_rank",
     "volatility_20d_xs_rank",
     "return_20d_vs_sector",
+    # Point-in-time fundamentals (live SEC data only), as cross-sectional ranks: value, quality, growth, size.
+    "earnings_yield_xs_rank",
+    "sales_yield_xs_rank",
+    "book_to_market_xs_rank",
+    "profit_margin_xs_rank",
+    "roe_xs_rank",
+    "revenue_growth_yoy_xs_rank",
+    "market_cap_xs_rank",
+    # Market conditions (FRED), the same for every stock on a date.
+    "vix",
+    "vix_change_20d",
+    "term_spread",
 ]
 CATEGORICAL_FEATURES = ["sector"]
-TARGET = "target_up_5d"
+# Features missing on more than this share of training rows are left out rather than imputed.
+MAX_MISSING_SHARE = 0.6
+TARGET = TARGET_COLUMNS[TARGET_MODE]
 # Tickers whose last price is older than this (relative to the newest price) are not ranked.
 MAX_STALENESS_DAYS = 7
+# A daily move this large in the last HORIZON_DAYS sessions is either an unadjusted corporate action
+# (spin-off, split) or a shock outside what the model has seen; such stocks are left out of the ranking.
+SUSPECT_DAILY_MOVE = 0.4
 
 MODEL_FACTORIES: dict[str, Callable[[], ClassifierMixin]] = {
     "logistic_regression": lambda: LogisticRegression(C=0.5, max_iter=2000),
@@ -50,7 +67,18 @@ DEFAULT_MODEL = "random_forest"
 
 
 def available_features(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    return [col for col in NUMERIC_FEATURES if col in df.columns], [col for col in CATEGORICAL_FEATURES if col in df.columns]
+    """Model inputs present in `df` with enough data to learn from (not mostly missing, not constant)."""
+    numeric = [
+        col
+        for col in NUMERIC_FEATURES
+        if col in df.columns and df[col].notna().mean() >= 1 - MAX_MISSING_SHARE and df[col].nunique(dropna=True) > 1
+    ]
+    return numeric, [col for col in CATEGORICAL_FEATURES if col in df.columns]
+
+
+def investable(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows for stocks that were index members on that date, when membership is known."""
+    return df[df["in_index"]] if "in_index" in df.columns else df
 
 
 def make_pipeline(model_name: str, numeric: list[str], categorical: list[str]) -> Pipeline:
@@ -88,7 +116,8 @@ def train_final_model(
 
     `validation` holds the walk-forward metrics that justify this model; they are stored with it.
     """
-    numeric, categorical = available_features(features)
+    features = investable(features)
+    numeric, categorical = available_features(features.dropna(subset=[TARGET]))
     pipeline = fit_model(model_name, features, numeric, categorical, max_rows)
     bundle = {
         "pipeline": pipeline,
@@ -96,6 +125,7 @@ def train_final_model(
         "numeric": numeric,
         "categorical": categorical,
         "trained_through": pd.Timestamp(features.dropna(subset=[TARGET])["date"].max()),
+        "target": TARGET_MODE,
         "metrics": validation or {},
     }
     if model_path is not None:
@@ -110,13 +140,33 @@ def load_model(path: Path = MODEL_PATH) -> dict:
     return joblib.load(path)
 
 
+def suspect_moves(features: pd.DataFrame, sessions: int = HORIZON_DAYS) -> dict[str, str]:
+    """Tickers with a daily move above SUSPECT_DAILY_MOVE in their last `sessions` rows, with an explanation."""
+    if "return_1d" not in features.columns:
+        return {}
+    recent = features.sort_values("date").groupby("ticker").tail(sessions)
+    flagged = recent[recent["return_1d"].abs() > SUSPECT_DAILY_MOVE]
+    worst = flagged.loc[flagged["return_1d"].abs().groupby(flagged["ticker"]).idxmax()]
+    return {
+        row.ticker: f"a {row.return_1d:+.0%} daily move on {row.date.date()} (possibly a corporate action the price source hasn't adjusted, or a shock outside the model's experience)"
+        for row in worst.itertuples()
+    }
+
+
 def score_latest(features: pd.DataFrame, model_bundle: dict, max_staleness_days: int = MAX_STALENESS_DAYS) -> pd.DataFrame:
-    """Score each ticker's most recent row, ranked by predicted probability (rank 1 = highest)."""
+    """Score each ticker's most recent row, ranked by predicted probability (rank 1 = highest).
+
+    Tickers left out because of a suspect recent move are listed in `result.attrs["excluded"]`.
+    """
     columns = model_bundle["numeric"] + model_bundle["categorical"]
-    latest = features.sort_values("date").groupby("ticker").tail(1)
+    members = investable(features)
+    latest = members.sort_values("date").groupby("ticker").tail(1)
     # Delisted or stale tickers would otherwise be ranked on old data alongside current ones.
     latest = latest[latest["date"] >= latest["date"].max() - pd.Timedelta(days=max_staleness_days)].copy()
-    latest["up_probability_5d"] = model_bundle["pipeline"].predict_proba(latest[columns])[:, 1]
-    latest = latest.sort_values("up_probability_5d", ascending=False).reset_index(drop=True)
+    excluded = suspect_moves(members[members["ticker"].isin(latest["ticker"])])
+    latest = latest[~latest["ticker"].isin(excluded)]
+    latest["model_probability"] = model_bundle["pipeline"].predict_proba(latest[columns])[:, 1]
+    latest = latest.sort_values("model_probability", ascending=False).reset_index(drop=True)
     latest["rank"] = latest.index + 1
+    latest.attrs["excluded"] = excluded
     return latest
