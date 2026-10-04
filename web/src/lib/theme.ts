@@ -52,7 +52,7 @@ export function useChartColors() {
 
 function readColors() {
   return {
-    series: [css("--series-1"), css("--series-2"), css("--series-3")],
+    series: [css("--series-1"), css("--series-2"), css("--series-3"), css("--series-4")],
     accent: css("--accent"),
     grid: css("--grid"),
     border: css("--border"),

@@ -96,7 +96,7 @@ def test_available_features_skips_sparse_and_constant_columns():
 def test_backtest_sharpe_is_in_excess_of_cash():
     dates = pd.bdate_range("2024-01-01", periods=50)
     preds = pd.DataFrame({"date": np.repeat(dates, 10), "ticker": [f"S{i}" for i in range(10)] * 50})
-    preds["tradable_return_5d"] = 0.002 + np.random.default_rng(0).normal(0, 0.01, len(preds))
+    preds["tradable_return"] = 0.002 + np.random.default_rng(0).normal(0, 0.01, len(preds))
     preds["probability"] = np.random.default_rng(1).uniform(size=len(preds))
     plain = run_backtest(preds, BacktestConfig(cost_bps=0)).summary.set_index("strategy")
     rate = pd.Series(0.05, index=dates)

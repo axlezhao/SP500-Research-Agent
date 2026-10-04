@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 import { useMemo } from "react";
-import { api, type ModelData } from "../api";
+import { api, type Experiment, type ModelData } from "../api";
 import { CalibrationChart, HorizontalBars, MultiLineChart } from "../components/charts";
 import { Card, DataTable, ErrorState, LoadingGrid, PageHeader, Pill, type Column } from "../components/ui";
-import { featureLabel, MODEL_LABELS, num, pct } from "../lib/format";
+import { featureLabel, MODEL_LABELS, num, pct, signedPct, tone } from "../lib/format";
 
 type Comparison = ModelData["comparison"][number];
 type Signal = ModelData["signals"][number];
@@ -40,6 +40,23 @@ export default function ModelLab() {
     { key: "pos", label: "Days IC > 0", align: "right", render: (r) => pct(r.ic_positive_share, 0) },
   ];
   const models = Object.keys(MODEL_LABELS).filter((m) => data.comparison.some((c) => c.model === m));
+  const reference = data.experiments.find((e) => e.reference)?.reference === "sp500" ? "S&P 500" : "Benchmark";
+  const experimentColumns: Column<Experiment>[] = [
+    { key: "setup", label: "Setup", render: (r) => <span className="font-medium">{r.setup} {r.production && <Pill className="ml-1">production</Pill>}</span> },
+    { key: "portfolio", label: "Portfolio", render: (r) => <span className="text-text-2">{r.portfolio ?? "—"}</span> },
+    { key: "ic", label: "Rank IC", align: "right", render: (r) => num(r.ic_mean, 4), sortValue: (r) => r.ic_mean },
+    { key: "t", label: "IC t-stat", align: "right", render: (r) => <span className={Math.abs(r.ic_tstat ?? 0) >= 2 ? "font-semibold" : ""}>{num(r.ic_tstat, 2)}</span>, sortValue: (r) => r.ic_tstat },
+    { key: "lo", label: "Long-only CAGR", align: "right", render: (r) => signedPct(r.long_only_cagr) },
+    { key: "ref", label: `${reference} CAGR`, align: "right", render: (r) => <span className="text-text-2">{signedPct(r.reference_cagr)}</span> },
+    { key: "ls", label: "Long-short CAGR", align: "right", render: (r) => <span className={tone(r.long_short_cagr)}>{signedPct(r.long_short_cagr)}</span>, sortValue: (r) => r.long_short_cagr },
+    {
+      key: "alpha",
+      label: "L/S alpha (t)",
+      align: "right",
+      render: (r) => (r.long_short_alpha === null ? "—" : <span className={Math.abs(r.long_short_alpha_t ?? 0) >= 2 ? "font-semibold" : ""}>{signedPct(r.long_short_alpha)} ({num(r.long_short_alpha_t, 2)})</span>),
+    },
+    { key: "turnover", label: "Turnover", align: "right", render: (r) => num(r.turnover, 2) },
+  ];
 
   return (
     <div className="space-y-5">
@@ -54,7 +71,16 @@ export default function ModelLab() {
           )
         }
       />
-      <Card title="Model comparison" subtitle="Out of sample. AUC 0.5 = no skill; IC t-stat from non-overlapping dates (|t| ≥ 2 shown in bold)" bodyClassName="p-0">
+      {data.experiments.length > 0 && (
+        <Card
+          title="Research setups tried"
+          subtitle={`The same model under each prediction horizon and peer group, walked forward and backtested after costs. Production is chosen by a rule fixed in advance: the highest rank-IC t-stat. Bold = |t| ≥ 2.`}
+          bodyClassName="p-0"
+        >
+          <DataTable rows={data.experiments.filter((e) => e.auc !== null)} columns={experimentColumns} rowKey={(r) => r.setup} />
+        </Card>
+      )}
+      <Card title={`Model comparison: ${data.spec.label}`} subtitle="Out of sample. AUC 0.5 = no skill; IC t-stat from non-overlapping dates (|t| ≥ 2 shown in bold)" bodyClassName="p-0">
         <DataTable rows={data.comparison} columns={comparisonColumns} rowKey={(r) => r.model} />
       </Card>
       <div className="grid gap-4 xl:grid-cols-2">

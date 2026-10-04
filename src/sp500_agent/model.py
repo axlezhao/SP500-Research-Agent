@@ -13,7 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from .config import HORIZON_DAYS, MODEL_PATH, TARGET_COLUMNS, TARGET_MODE
+from .config import MODEL_PATH, PRODUCTION_SPEC, ResearchSpec
 
 
 # Only features that were known on each row's date. Snapshot fundamentals are excluded
@@ -22,6 +22,7 @@ NUMERIC_FEATURES = [
     "return_5d",
     "return_20d",
     "momentum_60d",
+    "momentum_12_1",
     "volatility_20d",
     "ma_gap_50d",
     "volume_ratio_20d",
@@ -30,6 +31,7 @@ NUMERIC_FEATURES = [
     "return_20d_xs_rank",
     "momentum_60d_xs_rank",
     "volatility_20d_xs_rank",
+    "momentum_12_1_xs_rank",
     "return_20d_vs_sector",
     # Point-in-time fundamentals (live SEC data only), as cross-sectional ranks: value, quality, growth, size.
     "earnings_yield_xs_rank",
@@ -47,10 +49,11 @@ NUMERIC_FEATURES = [
 CATEGORICAL_FEATURES = ["sector"]
 # Features missing on more than this share of training rows are left out rather than imputed.
 MAX_MISSING_SHARE = 0.6
-TARGET = TARGET_COLUMNS[TARGET_MODE]
+# The production target column; functions take a ResearchSpec to use another one.
+TARGET = PRODUCTION_SPEC.target_column
 # Tickers whose last price is older than this (relative to the newest price) are not ranked.
 MAX_STALENESS_DAYS = 7
-# A daily move this large in the last HORIZON_DAYS sessions is either an unadjusted corporate action
+# A daily move this large in the last few sessions is either an unadjusted corporate action
 # (spin-off, split) or a shock outside what the model has seen; such stocks are left out of the ranking.
 SUSPECT_DAILY_MOVE = 0.4
 
@@ -98,10 +101,10 @@ def sample_rows(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     return df.sample(n=max_rows, random_state=42) if len(df) > max_rows else df
 
 
-def fit_model(model_name: str, rows: pd.DataFrame, numeric: list[str], categorical: list[str], max_rows: int = 200_000) -> Pipeline:
-    rows = sample_rows(rows.dropna(subset=[TARGET]), max_rows)
+def fit_model(model_name: str, rows: pd.DataFrame, numeric: list[str], categorical: list[str], max_rows: int = 200_000, target: str = TARGET) -> Pipeline:
+    rows = sample_rows(rows.dropna(subset=[target]), max_rows)
     pipeline = make_pipeline(model_name, numeric, categorical)
-    pipeline.fit(rows[numeric + categorical], rows[TARGET].astype(int))
+    pipeline.fit(rows[numeric + categorical], rows[target].astype(int))
     return pipeline
 
 
@@ -111,21 +114,23 @@ def train_final_model(
     validation: dict | None = None,
     max_rows: int = 200_000,
     model_path: Path | None = MODEL_PATH,
+    spec: ResearchSpec = PRODUCTION_SPEC,
 ) -> dict:
     """Fit on every labelled row so current predictions use the most recent data, and save the bundle.
 
     `validation` holds the walk-forward metrics that justify this model; they are stored with it.
     """
     features = investable(features)
-    numeric, categorical = available_features(features.dropna(subset=[TARGET]))
-    pipeline = fit_model(model_name, features, numeric, categorical, max_rows)
+    labelled = features.dropna(subset=[spec.target_column])
+    numeric, categorical = available_features(labelled)
+    pipeline = fit_model(model_name, features, numeric, categorical, max_rows, target=spec.target_column)
     bundle = {
         "pipeline": pipeline,
         "model_name": model_name,
         "numeric": numeric,
         "categorical": categorical,
-        "trained_through": pd.Timestamp(features.dropna(subset=[TARGET])["date"].max()),
-        "target": TARGET_MODE,
+        "trained_through": pd.Timestamp(labelled["date"].max()),
+        "spec": spec.as_dict(),
         "metrics": validation or {},
     }
     if model_path is not None:
@@ -140,7 +145,7 @@ def load_model(path: Path = MODEL_PATH) -> dict:
     return joblib.load(path)
 
 
-def suspect_moves(features: pd.DataFrame, sessions: int = HORIZON_DAYS) -> dict[str, str]:
+def suspect_moves(features: pd.DataFrame, sessions: int = 5) -> dict[str, str]:
     """Tickers with a daily move above SUSPECT_DAILY_MOVE in their last `sessions` rows, with an explanation."""
     if "return_1d" not in features.columns:
         return {}

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .backtest import BacktestConfig, BacktestResult, config_dict, run_backtest
-from .config import EXECUTION_LAG_DAYS, HORIZON_DAYS, MODEL_PATH, RESEARCH_DIR, TARGET_DESCRIPTION
-from .model import TARGET, available_features, investable, train_final_model
-from .validation import calibration_table, compare_models, feature_importance, signal_report
+from .attribution import FACTOR_LABELS, attribute
+from .backtest import MARKET, BacktestConfig, BacktestResult, config_dict, run_backtest
+from .config import EXECUTION_LAG_DAYS, EXPERIMENT_SPECS, MODEL_PATH, PRODUCTION_SPEC, RESEARCH_DIR, ResearchSpec
+from .model import available_features, investable, train_final_model
+from .validation import calibration_table, compare_models, feature_importance, signal_report, summarise, walk_forward
+
+STRATEGY_NAMES = {"long_only": "Long top 20%", "long_short": "Long-short", "benchmark": "Equal-weight benchmark", MARKET: "S&P 500 (SPY)"}
+EXPERIMENT_MODEL = "logistic_regression"
 
 ARTIFACT_FILES = {
     "eda": "eda.json",
@@ -26,6 +30,10 @@ ARTIFACT_FILES = {
     "backtest_summary": "backtest_summary.csv",
     "quantile_returns": "quantile_returns.csv",
     "backtest_config": "backtest_config.json",
+    "attribution": "attribution.csv",
+    "factor_returns": "factor_returns.parquet",
+    "experiments": "experiments.csv",
+    "spec": "spec.json",
     "report": "research_report.md",
 }
 
@@ -44,9 +52,13 @@ class ResearchRun:
     bundle: dict
     report: str
     quality: dict | None = None
+    spec: ResearchSpec = PRODUCTION_SPEC
+    attribution: pd.DataFrame | None = None
+    factors: pd.DataFrame | None = None
+    experiments: pd.DataFrame | None = None
 
 
-def exploratory_summary(features: pd.DataFrame) -> dict:
+def exploratory_summary(features: pd.DataFrame, spec: ResearchSpec = PRODUCTION_SPEC) -> dict:
     universe = investable(features)
     labelled = universe.dropna(subset=["future_return_5d"])
     returns = labelled["future_return_5d"]
@@ -62,8 +74,8 @@ def exploratory_summary(features: pd.DataFrame) -> dict:
         "start": str(features["date"].min().date()),
         "end": str(features["date"].max().date()),
         "trading_days": int(features["date"].nunique()),
-        "target": TARGET_DESCRIPTION,
-        "target_rate": float(labelled[TARGET].mean()),
+        "target": spec.description,
+        "target_rate": float(labelled[spec.target_column].mean()),
         "up_rate_5d": float((labelled["future_return_5d"] > 0).mean()),
         "forward_return_5d": {
             "mean": float(returns.mean()),
@@ -86,17 +98,28 @@ def run_research(
     model_path: Path | None = MODEL_PATH,
     max_rows: int = 150_000,
     quality: dict | None = None,
+    spec: ResearchSpec = PRODUCTION_SPEC,
+    index_prices: pd.Series | None = None,
+    experiment_specs: tuple[ResearchSpec, ...] | None = EXPERIMENT_SPECS,
 ) -> ResearchRun:
-    eda = exploratory_summary(features)
-    comparison, results = compare_models(features, n_splits=n_splits, max_rows=max_rows)
+    """Compare models for `spec`, backtest and attribute the best, compare research setups, save everything."""
+    eda = exploratory_summary(features, spec)
+    comparison, results = compare_models(features, n_splits=n_splits, max_rows=max_rows, spec=spec)
     best = comparison.iloc[0]["model"]
     best_result = results[best]
     predictions = best_result.predictions
     # 3-month T-bill yield (FRED, % a year) as the cash return for Sharpe ratios, when available.
     risk_free = features.groupby("date")["tbill_3m"].first() / 100 if "tbill_3m" in features.columns else None
-    backtest = run_backtest(predictions, backtest_config, risk_free=risk_free)
+    config = backtest_config_for(spec, backtest_config)
+    backtest = run_backtest(predictions, config, risk_free=risk_free, index_prices=index_prices)
+    attribution, factors = attribute(features, backtest.returns, spec.horizon, spec.tradable_column)
+    experiments = (
+        run_experiments(features, experiment_specs, n_splits, max_rows, backtest_config, risk_free, index_prices, production=spec)
+        if experiment_specs
+        else None
+    )
     validation = comparison.iloc[0].to_dict()
-    bundle = train_final_model(features, best, validation=validation, max_rows=max_rows, model_path=model_path)
+    bundle = train_final_model(features, best, validation=validation, max_rows=max_rows, model_path=model_path, spec=spec)
     run = ResearchRun(
         eda=eda,
         comparison=comparison,
@@ -105,16 +128,79 @@ def run_research(
         predictions=predictions,
         calibration=calibration_table(predictions),
         importance=feature_importance(best_result),
-        signals=signal_report(features, predictions),
+        signals=signal_report(features, predictions, spec),
         backtest=backtest,
         bundle=bundle,
         report="",
         quality=quality,
+        spec=spec,
+        attribution=attribution,
+        factors=factors,
+        experiments=experiments,
     )
     run.report = render_report(run)
     if output_dir is not None:
         save_artifacts(run, output_dir)
     return run
+
+
+def backtest_config_for(spec: ResearchSpec, base: BacktestConfig | None = None) -> BacktestConfig:
+    """Hold for the prediction horizon; a sector-relative target trades sector-neutral portfolios."""
+    return replace(base or BacktestConfig(), holding_days=spec.horizon, neutralize="sector" if spec.relative_to == "sector" else "none")
+
+
+def run_experiments(
+    features: pd.DataFrame,
+    specs: tuple[ResearchSpec, ...],
+    n_splits: int,
+    max_rows: int,
+    base_config: BacktestConfig | None,
+    risk_free: pd.Series | None,
+    index_prices: pd.Series | None,
+    production: ResearchSpec = PRODUCTION_SPEC,
+) -> pd.DataFrame:
+    """Each research setup walked forward with the same model, backtested and attributed.
+
+    The production setup is chosen by a rule fixed in advance: the highest out-of-sample rank-IC t-stat.
+    """
+    rows = []
+    for spec in specs:
+        try:
+            result = walk_forward(features, EXPERIMENT_MODEL, n_splits, max_rows, spec)
+        except ValueError as exc:  # e.g. no sector has enough members for a sector-relative target
+            rows.append({"setup": spec.label, "horizon": spec.horizon, "relative_to": spec.relative_to, "production": spec == production, "note": str(exc)})
+            continue
+        quality = summarise(result)
+        config = backtest_config_for(spec, base_config)
+        backtest = run_backtest(result.predictions, config, risk_free=risk_free, index_prices=index_prices)
+        stats = backtest.summary.set_index("strategy")
+        attribution, _ = attribute(features, backtest.returns, spec.horizon, spec.tradable_column)
+        alpha = attribution.set_index("strategy") if not attribution.empty else pd.DataFrame()
+        reference = MARKET if MARKET in stats.index else "benchmark"
+        rows.append({
+            "setup": spec.label,
+            "horizon": spec.horizon,
+            "relative_to": spec.relative_to,
+            "portfolio": "sector-neutral" if config.neutralize == "sector" else "top/bottom 20% overall",
+            "production": spec == production,
+            "auc": quality["auc_mean"],
+            "ic_mean": quality["ic_mean"],
+            "ic_tstat": quality["ic_tstat"],
+            "long_only_cagr": stats.loc["long_only", "cagr"],
+            "long_only_sharpe": stats.loc["long_only", "sharpe"],
+            "reference": reference,
+            "reference_cagr": stats.loc[reference, "cagr"],
+            "reference_sharpe": stats.loc[reference, "sharpe"],
+            "long_short_cagr": stats.loc["long_short", "cagr"],
+            "long_short_sharpe": stats.loc["long_short", "sharpe"],
+            "long_short_alpha": alpha.loc["long_short", "alpha_annual"] if "long_short" in alpha.index else np.nan,
+            "long_short_alpha_t": alpha.loc["long_short", "alpha_tstat"] if "long_short" in alpha.index else np.nan,
+            "long_only_alpha": alpha.loc["long_only", "alpha_annual"] if "long_only" in alpha.index else np.nan,
+            "long_only_alpha_t": alpha.loc["long_only", "alpha_tstat"] if "long_only" in alpha.index else np.nan,
+            "turnover": stats.loc["long_only", "avg_turnover"],
+            "rebalances": int(stats.loc["long_only", "periods"]),
+        })
+    return pd.DataFrame(rows)
 
 
 def save_artifacts(run: ResearchRun, output_dir: Path = RESEARCH_DIR) -> None:
@@ -131,6 +217,14 @@ def save_artifacts(run: ResearchRun, output_dir: Path = RESEARCH_DIR) -> None:
     run.backtest.summary.to_csv(path["backtest_summary"], index=False)
     run.backtest.quantile_returns.to_csv(path["quantile_returns"], index=False)
     path["backtest_config"].write_text(json.dumps(config_dict(run.backtest.config), indent=2))
+    path["spec"].write_text(json.dumps(run.spec.as_dict(), indent=2))
+    for key, frame in [("attribution", run.attribution), ("experiments", run.experiments)]:
+        if frame is not None and not frame.empty:
+            frame.to_csv(path[key], index=False)
+        elif path[key].exists():
+            path[key].unlink()
+    if run.factors is not None:
+        run.factors.to_parquet(path["factor_returns"], index=False)
     path["report"].write_text(run.report, encoding="utf-8")
 
 
@@ -142,7 +236,10 @@ def load_artifacts(output_dir: Path = RESEARCH_DIR) -> dict:
         if not path.exists():
             artifacts[key] = None
         elif name.endswith(".csv"):
-            artifacts[key] = pd.read_csv(path)
+            try:
+                artifacts[key] = pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                artifacts[key] = None
         elif name.endswith(".parquet"):
             artifacts[key] = pd.read_parquet(path)
         elif name.endswith(".json"):
@@ -199,6 +296,54 @@ def _data_and_caveats(eda: dict, quality: dict, has_cash: bool) -> tuple[str, st
     return "\n".join(lines), "\n".join(caveats)
 
 
+def _attribution_text(attribution: pd.DataFrame | None) -> str:
+    if attribution is None or attribution.empty:
+        return "Not enough data for a factor attribution."
+    columns = {"strategy": "strategy", "alpha_annual": "alpha / year", "alpha_tstat": "alpha t"}
+    for factor in FACTOR_LABELS:
+        if f"beta_{factor}" in attribution.columns:
+            columns[f"beta_{factor}"] = f"{factor} beta"
+    columns["r_squared"] = "R²"
+    table = attribution[[c for c in columns if c in attribution.columns]].rename(columns=columns)
+    table["strategy"] = table["strategy"].map(STRATEGY_NAMES).fillna(table["strategy"])
+    for col in table.columns[1:]:
+        table[col] = table[col].map(_pct if col == "alpha / year" else (lambda v: _num(v, 2)))
+    return (
+        "Each strategy's returns regressed on market, size, value and momentum factors built from the same members and dates "
+        "(long-only in excess of T-bills). Alpha is the part the factors don't explain; |t| above about 2 would be meaningful.\n\n"
+        + _table(table)
+    )
+
+
+def _experiments_text(experiments: pd.DataFrame | None) -> str:
+    if experiments is None or experiments.empty:
+        return ""
+    skipped = experiments[experiments["auc"].isna()] if "auc" in experiments else experiments
+    experiments = experiments.dropna(subset=["auc"]) if "auc" in experiments else experiments.iloc[0:0]
+    note = "".join(f"\n\nNot evaluated: {row.setup} ({row.note})." for row in skipped.itertuples()) if "note" in skipped else ""
+    if experiments.empty:
+        return "## 4. Experiments: what was tried" + note
+    table = pd.DataFrame({
+        "setup": experiments["setup"] + experiments["production"].map(lambda p: " (production)" if p else ""),
+        "portfolio": experiments["portfolio"],
+        "AUC": experiments["auc"].map(lambda v: _num(v, 3)),
+        "rank IC": experiments["ic_mean"].map(lambda v: _num(v, 4)),
+        "IC t": experiments["ic_tstat"].map(lambda v: _num(v, 2)),
+        "long-only CAGR": experiments["long_only_cagr"].map(_pct),
+        "reference CAGR": experiments["reference_cagr"].map(_pct),
+        "long-short CAGR": experiments["long_short_cagr"].map(_pct),
+        "long-short alpha (t)": [f"{_pct(a)} ({_num(t, 2)})" for a, t in zip(experiments["long_short_alpha"], experiments["long_short_alpha_t"])],
+        "turnover": experiments["turnover"].map(lambda v: _num(v, 2)),
+    })
+    reference = "the S&P 500" if (experiments["reference"] == MARKET).all() else "the equal-weight benchmark"
+    return (
+        "## 4. Experiments: what was tried\n\n"
+        f"The same model ({EXPERIMENT_MODEL.replace('_', ' ')}) under each research setup, walked forward and backtested the same way. "
+        f"Reference CAGR is {reference} over the same periods. The production setup is chosen by a rule fixed in advance: "
+        "the highest out-of-sample rank-IC t-stat.\n\n" + _table(table) + note
+    )
+
+
 def render_report(run: ResearchRun) -> str:
     eda, best = run.eda, run.comparison.iloc[0]
     comparison = pd.DataFrame(
@@ -215,7 +360,7 @@ def render_report(run: ResearchRun) -> str:
     summary = run.backtest.summary
     backtest = pd.DataFrame(
         {
-            "strategy": summary["strategy"],
+            "strategy": summary["strategy"].map(STRATEGY_NAMES).fillna(summary["strategy"]),
             "total return": summary["total_return"].map(_pct),
             "CAGR": summary["cagr"].map(_pct),
             "volatility": summary["ann_volatility"].map(_pct),
@@ -245,6 +390,8 @@ def render_report(run: ResearchRun) -> str:
         else "The model shows a modest out-of-sample edge. Check it survives realistic costs, other periods and the survivorship caveat before trusting it."
     )
     data_lines, caveats = _data_and_caveats(eda, run.quality or {}, "cash" in run.backtest.returns.columns)
+    attribution_text = _attribution_text(run.attribution)
+    experiments_text = _experiments_text(run.experiments)
     news_line = (
         f"- Rows with at least one news article in the previous 20 sessions: {_pct(eda['share_of_rows_with_recent_news'])}."
         if eda["share_of_rows_with_recent_news"] > 0
@@ -253,6 +400,8 @@ def render_report(run: ResearchRun) -> str:
     return f"""# S&P 500 Research Report
 
 Generated from {eda['tickers']} stocks, {eda['start']} to {eda['end']} ({eda['trading_days']} trading days, {eda['rows']:,} rows).
+
+**Prediction target:** will a stock {run.spec.description}?
 
 **Bottom line.** {verdict}
 
@@ -265,11 +414,11 @@ Generated from {eda['tickers']} stocks, {eda['start']} to {eda['end']} ({eda['tr
 
 ## 2. Model comparison (walk-forward)
 
-{run.comparison.iloc[0]['folds']:.0f} expanding-window folds; each trains only on dates before its test block, with a {HORIZON_DAYS}-session gap so labels never overlap. Out-of-sample period: {pd.Timestamp(best['oos_start']).date()} to {pd.Timestamp(best['oos_end']).date()}.
+{run.comparison.iloc[0]['folds']:.0f} expanding-window folds; each trains only on dates before its test block, with a {run.spec.horizon}-session gap so labels never overlap. Out-of-sample period: {pd.Timestamp(best['oos_start']).date()} to {pd.Timestamp(best['oos_end']).date()}.
 
 {_table(comparison)}
 
-Selected model: **{run.best_model}** (highest mean AUC). AUC 0.5 means no skill. IC is the average daily rank correlation between the prediction and the realised 5-day return; its t-stat uses non-overlapping dates only (|t| > 2 is the usual bar).
+Selected model: **{run.best_model}** (highest mean AUC). AUC 0.5 means no skill. IC is the average daily rank correlation between the prediction and the realised {run.spec.horizon}-day return; its t-stat uses non-overlapping dates only (|t| > 2 is the usual bar).
 
 ### Calibration of {run.best_model}
 
@@ -287,7 +436,7 @@ Information coefficient of each input on its own over the same period. If a sing
 
 ## 3. Backtest
 
-Every {cfg.holding_days} sessions, rank stocks by the out-of-sample probability. Enter {EXECUTION_LAG_DAYS} session after the signal and hold for {cfg.holding_days} sessions. Long-only buys the top {cfg.quantile:.0%}; long-short also shorts the bottom {cfg.quantile:.0%}; the benchmark holds every stock equally. Costs: {cfg.cost_bps:g} bps per unit of weight traded.
+Every {cfg.holding_days} sessions, rank stocks by the out-of-sample probability. Enter {EXECUTION_LAG_DAYS} session after the signal and hold for {cfg.holding_days} sessions. Long-only buys the top {cfg.quantile:.0%}{" of each sector" if cfg.neutralize == "sector" else ""}; long-short also shorts the bottom {cfg.quantile:.0%}{" of each sector" if cfg.neutralize == "sector" else ""}; the equal-weight benchmark holds every member equally{"; the S&P 500 is SPY with dividends reinvested" if MARKET in set(summary["strategy"]) else ""}. Costs: {cfg.cost_bps:g} bps per unit of weight traded.
 
 {_table(backtest)}
 
@@ -295,10 +444,16 @@ Return by prediction quintile (Q5 = highest predicted probability):
 
 {_table(quantiles)}
 
-## 4. Caveats
+### Where the returns come from
+
+{attribution_text}
+
+{experiments_text}
+
+## 5. Caveats
 
 {caveats}
 - **Costs and execution** are simplified: a flat cost per unit traded, no market impact, no borrow cost for shorts.
-- **Multiple testing.** Three models were compared; the best one's scores are slightly optimistic for that reason alone.
+- **Multiple testing.** Three models and {len(run.experiments) if run.experiments is not None else 1} research setups were compared; the best results are somewhat optimistic for that reason alone.
 - Educational project, not investment advice.
 """

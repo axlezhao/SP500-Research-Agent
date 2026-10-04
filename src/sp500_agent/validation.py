@@ -1,7 +1,10 @@
 """Walk-forward validation, model comparison and signal diagnostics.
 
 Every number here comes from out-of-sample predictions: each fold trains only on dates before its
-test window, with a HORIZON_DAYS gap so no training label overlaps a test label.
+test window, with a gap of `spec.horizon` sessions so no training label overlaps a test label.
+
+Predictions carry generic columns (target, future_return, tradable_return) for the spec they were
+made under, so the backtest and diagnostics work the same for any horizon or comparison group.
 """
 
 from __future__ import annotations
@@ -14,8 +17,8 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 
-from .config import HORIZON_DAYS
-from .model import MODEL_FACTORIES, TARGET, available_features, fit_model, investable, sample_rows
+from .config import PRODUCTION_SPEC, ResearchSpec
+from .model import MODEL_FACTORIES, available_features, fit_model, investable, sample_rows
 
 
 @dataclass(frozen=True)
@@ -29,14 +32,15 @@ class Fold:
 @dataclass
 class WalkForwardResult:
     model_name: str
-    predictions: pd.DataFrame  # date, ticker, fold, probability, target and forward returns
+    predictions: pd.DataFrame  # date, ticker, fold, probability, target, future_return, tradable_return
     fold_metrics: pd.DataFrame
+    spec: ResearchSpec = PRODUCTION_SPEC
     columns: list[str] = field(default_factory=list)
     last_pipeline: Pipeline | None = None
     last_test: pd.DataFrame | None = field(default=None, repr=False)
 
 
-def walk_forward_folds(dates, n_splits: int = 5, min_train_fraction: float = 0.5, embargo_days: int = HORIZON_DAYS) -> list[Fold]:
+def walk_forward_folds(dates, n_splits: int = 5, min_train_fraction: float = 0.5, embargo_days: int = PRODUCTION_SPEC.horizon) -> list[Fold]:
     """Expanding-window folds: train on everything before the gap, test on the next block of dates."""
     dates = np.sort(pd.unique(pd.Series(dates)))
     first_test = int(len(dates) * min_train_fraction)
@@ -54,7 +58,7 @@ def walk_forward_folds(dates, n_splits: int = 5, min_train_fraction: float = 0.5
     ]
 
 
-def information_coefficients(df: pd.DataFrame, score_col: str, return_col: str = "future_return_5d", min_names: int = 5) -> pd.Series:
+def information_coefficients(df: pd.DataFrame, score_col: str, return_col: str = "future_return", min_names: int = 5) -> pd.Series:
     """Per-date Spearman rank correlation between a score and the forward return (the quant 'IC').
 
     Computed with grouped sums rather than a Python call per date, which matters with thousands of dates.
@@ -74,10 +78,10 @@ def information_coefficients(df: pd.DataFrame, score_col: str, return_col: str =
     return (cov[valid] / np.sqrt(var_x[valid] * var_y[valid])).rename(None)
 
 
-def ic_summary(ic: pd.Series, step: int = HORIZON_DAYS) -> dict:
+def ic_summary(ic: pd.Series, step: int = PRODUCTION_SPEC.horizon) -> dict:
     """Mean IC over all dates; t-stat from every `step`-th date only.
 
-    Consecutive daily ICs on 5-day forward returns share 4 of their 5 days, so treating them as
+    Consecutive daily ICs on h-day forward returns share h-1 of their h days, so treating them as
     independent would inflate the t-stat by roughly sqrt(step). Non-overlapping dates avoid that.
     """
     independent = ic.iloc[::step]
@@ -94,9 +98,9 @@ def ic_summary(ic: pd.Series, step: int = HORIZON_DAYS) -> dict:
     }
 
 
-def _fold_metrics(fold: Fold, train: pd.DataFrame, test: pd.DataFrame, probability: np.ndarray) -> dict:
-    y = test[TARGET].astype(int)
-    majority = int(train[TARGET].mean() >= 0.5)
+def _fold_metrics(fold: Fold, train: pd.DataFrame, test: pd.DataFrame, probability: np.ndarray, spec: ResearchSpec) -> dict:
+    y = test["target"].astype(int)
+    majority = int(train[spec.target_column].mean() >= 0.5)
     scored = test.assign(probability=probability)
     two_classes = y.nunique() == 2
     return {
@@ -115,24 +119,26 @@ def _fold_metrics(fold: Fold, train: pd.DataFrame, test: pd.DataFrame, probabili
     }
 
 
-def walk_forward(features: pd.DataFrame, model_name: str, n_splits: int = 5, max_rows: int = 150_000) -> WalkForwardResult:
-    labelled = investable(features).dropna(subset=[TARGET])
+def walk_forward(features: pd.DataFrame, model_name: str, n_splits: int = 5, max_rows: int = 150_000, spec: ResearchSpec = PRODUCTION_SPEC) -> WalkForwardResult:
+    labelled = investable(features).dropna(subset=[spec.target_column])
+    labelled = labelled.assign(target=labelled[spec.target_column], future_return=labelled[spec.future_column], tradable_return=labelled[spec.tradable_column])
     numeric, categorical = available_features(labelled)
     columns = numeric + categorical
-    keep = ["date", "ticker", "sector", TARGET, "future_return_5d", "tradable_return_5d"]
+    keep = ["date", "ticker", "sector", "target", "future_return", "tradable_return"]
     predictions, metrics = [], []
     pipeline, test = None, None
-    for fold in walk_forward_folds(labelled["date"], n_splits=n_splits):
+    for fold in walk_forward_folds(labelled["date"], n_splits=n_splits, embargo_days=spec.horizon):
         train = labelled[labelled["date"] <= fold.train_end]
         test = labelled[(labelled["date"] >= fold.test_start) & (labelled["date"] <= fold.test_end)]
-        pipeline = fit_model(model_name, train, numeric, categorical, max_rows)
+        pipeline = fit_model(model_name, train, numeric, categorical, max_rows, target=spec.target_column)
         probability = pipeline.predict_proba(test[columns])[:, 1]
-        metrics.append(_fold_metrics(fold, train, test, probability))
+        metrics.append(_fold_metrics(fold, train, test, probability, spec))
         predictions.append(test[[col for col in keep if col in test.columns]].assign(fold=fold.number, probability=probability))
     return WalkForwardResult(
         model_name=model_name,
         predictions=pd.concat(predictions, ignore_index=True),
         fold_metrics=pd.DataFrame(metrics),
+        spec=spec,
         columns=columns,
         last_pipeline=pipeline,
         last_test=test,
@@ -146,10 +152,10 @@ def summarise(result: WalkForwardResult) -> dict:
         "model": result.model_name,
         "auc_mean": folds["auc"].mean(),
         "auc_std": folds["auc"].std(),
-        "accuracy": accuracy_score(preds[TARGET].astype(int), preds["probability"] >= 0.5),
+        "accuracy": accuracy_score(preds["target"].astype(int), preds["probability"] >= 0.5),
         "baseline_accuracy": folds["baseline_accuracy"].mean(),
-        "brier": brier_score_loss(preds[TARGET].astype(int), preds["probability"]),
-        **ic_summary(information_coefficients(preds, "probability")),
+        "brier": brier_score_loss(preds["target"].astype(int), preds["probability"]),
+        **ic_summary(information_coefficients(preds, "probability"), step=result.spec.horizon),
         "oos_start": preds["date"].min(),
         "oos_end": preds["date"].max(),
         "folds": len(folds),
@@ -157,31 +163,29 @@ def summarise(result: WalkForwardResult) -> dict:
 
 
 def compare_models(
-    features: pd.DataFrame, model_names: list[str] | None = None, n_splits: int = 5, max_rows: int = 150_000
+    features: pd.DataFrame, model_names: list[str] | None = None, n_splits: int = 5, max_rows: int = 150_000, spec: ResearchSpec = PRODUCTION_SPEC
 ) -> tuple[pd.DataFrame, dict[str, WalkForwardResult]]:
-    results = {name: walk_forward(features, name, n_splits, max_rows) for name in (model_names or list(MODEL_FACTORIES))}
+    results = {name: walk_forward(features, name, n_splits, max_rows, spec) for name in (model_names or list(MODEL_FACTORIES))}
     comparison = pd.DataFrame([summarise(result) for result in results.values()])
     return comparison.sort_values("auc_mean", ascending=False).reset_index(drop=True), results
 
 
 def calibration_table(predictions: pd.DataFrame, bins: int = 10) -> pd.DataFrame:
     """Do predicted probabilities match how often the predicted event actually happened?"""
-    df = predictions.dropna(subset=["probability", TARGET])
+    df = predictions.dropna(subset=["probability", "target"])
     df = df.assign(bucket=pd.qcut(df["probability"].rank(method="first"), q=min(bins, len(df)), labels=False))
-    table = df.groupby("bucket").agg(
-        mean_predicted=("probability", "mean"), actual_rate=(TARGET, "mean"), rows=(TARGET, "size")
-    )
+    table = df.groupby("bucket").agg(mean_predicted=("probability", "mean"), actual_rate=("target", "mean"), rows=("target", "size"))
     return table.reset_index(drop=True).rename_axis("bucket").reset_index().assign(bucket=lambda t: t["bucket"] + 1)
 
 
 def feature_importance(result: WalkForwardResult, max_rows: int = 20_000, n_repeats: int = 5) -> pd.DataFrame:
     """Permutation importance on the last fold's unseen test rows: how much AUC drops when a feature is shuffled."""
-    if result.last_pipeline is None or result.last_test is None or result.last_test[TARGET].nunique() < 2:
+    if result.last_pipeline is None or result.last_test is None or result.last_test["target"].nunique() < 2:
         return pd.DataFrame(columns=["feature", "importance_mean", "importance_std"])
     test = sample_rows(result.last_test, max_rows)
     columns = result.columns
     importance = permutation_importance(
-        result.last_pipeline, test[columns], test[TARGET].astype(int), scoring="roc_auc", n_repeats=n_repeats, random_state=42, n_jobs=1
+        result.last_pipeline, test[columns], test["target"].astype(int), scoring="roc_auc", n_repeats=n_repeats, random_state=42, n_jobs=1
     )
     return (
         pd.DataFrame({"feature": columns, "importance_mean": importance.importances_mean, "importance_std": importance.importances_std})
@@ -190,7 +194,7 @@ def feature_importance(result: WalkForwardResult, max_rows: int = 20_000, n_repe
     )
 
 
-def signal_report(features: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataFrame:
+def signal_report(features: pd.DataFrame, predictions: pd.DataFrame, spec: ResearchSpec = PRODUCTION_SPEC) -> pd.DataFrame:
     """IC of each raw feature over the out-of-sample period, next to the model's IC.
 
     A model that cannot beat its best single input is not adding much.
@@ -198,7 +202,7 @@ def signal_report(features: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataF
     features = investable(features)
     window = features[(features["date"] >= predictions["date"].min()) & (features["date"] <= predictions["date"].max())]
     numeric, _ = available_features(window)
-    rows = [{"signal": "model_probability", **ic_summary(information_coefficients(predictions, "probability"))}]
+    rows = [{"signal": "model_probability", **ic_summary(information_coefficients(predictions, "probability"), step=spec.horizon)}]
     for col in numeric:
-        rows.append({"signal": col, **ic_summary(information_coefficients(window, col))})
+        rows.append({"signal": col, **ic_summary(information_coefficients(window, col, spec.future_column), step=spec.horizon)})
     return pd.DataFrame(rows).sort_values("ic_mean", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)

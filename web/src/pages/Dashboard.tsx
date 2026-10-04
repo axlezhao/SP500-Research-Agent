@@ -52,7 +52,7 @@ export default function Dashboard() {
         <Stat label="Stocks ranked" value={o.stocks_ranked} hint={Object.keys(o.left_out_of_ranking).length ? `${Object.keys(o.left_out_of_ranking).length} left out (data warnings)` : "Index members today"} />
         <Stat label="Walk-forward AUC" value={num(m.auc_mean, 3)} hint="0.500 = no skill" help="Area under the ROC curve on out-of-sample folds." />
         <Stat label="Rank IC" value={num(m.ic_mean, 3)} hint={`t-stat ${num(m.ic_tstat, 2)}`} help="Average daily rank correlation between prediction and realised 5-day return; t-stat from non-overlapping dates." />
-        <Stat label="Long top 20%" value={signedPct(bt.long_only?.total_return, 0)} tone={tone(bt.long_only?.total_return)} hint={`Benchmark ${signedPct(bt.benchmark?.total_return, 0)}`} />
+        <Stat label="Long top 20%" value={signedPct(bt.long_only?.total_return, 0)} tone={tone(bt.long_only?.total_return)} hint={bt.sp500 ? `S&P 500 ${signedPct(bt.sp500.total_return, 0)}` : `Benchmark ${signedPct(bt.benchmark?.total_return, 0)}`} />
         <Stat label="Long-short Sharpe" value={num(bt.long_short?.sharpe, 2)} tone={tone(bt.long_short?.sharpe)} hint="After costs, out of sample" />
         <Stat label="VIX" value={num(vix?.latest, 1)} hint={vix?.percentile_10y != null ? `${Math.round(vix.percentile_10y * 100)}th pct. of 10 years` : undefined} />
       </div>
@@ -73,10 +73,10 @@ export default function Dashboard() {
       </Callout>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <Card title="Highest ranked" subtitle="Most likely to beat the median member" action={<Link to="/screener" className="inline-flex items-center gap-1 text-xs font-medium text-accent">Screener <ArrowRight size={12} /></Link>} bodyClassName="p-0">
+        <Card title="Highest ranked" subtitle={`Most likely to ${o.target}`} action={<Link to="/screener" className="inline-flex items-center gap-1 text-xs font-medium text-accent">Screener <ArrowRight size={12} /></Link>} bodyClassName="p-0">
           <DataTable rows={o.top} columns={rankedColumns} rowKey={(r) => r.ticker} onRowClick={open} dense />
         </Card>
-        <Card title="Lowest ranked" subtitle="Least likely to beat the median member" bodyClassName="p-0">
+        <Card title="Lowest ranked" subtitle={`Least likely to ${o.target}`} bodyClassName="p-0">
           <DataTable rows={o.bottom} columns={rankedColumns} rowKey={(r) => r.ticker} onRowClick={open} dense />
         </Card>
       </div>
@@ -84,7 +84,7 @@ export default function Dashboard() {
       <div className="grid gap-4 xl:grid-cols-5">
         <Card title="Backtest: growth of $1" subtitle={backtest.data ? `Out of sample, after costs · ${backtest.data.growth.length} rebalances` : undefined} className="xl:col-span-3">
           {backtest.data ? (
-            <MultiLineChart data={backtest.data.growth} series={[{ key: "long_only", label: "Long top 20%" }, { key: "long_short", label: "Long-short" }, { key: "benchmark", label: "Equal-weight benchmark" }]} yFormat={(v) => `$${v.toFixed(2)}`} height={260} reference={1} />
+            <MultiLineChart data={backtest.data.growth} series={Object.entries(backtest.data.labels).map(([key, label]) => ({ key, label }))} yFormat={(v) => `$${v.toFixed(2)}`} height={260} reference={1} />
           ) : (
             <div className="h-64" />
           )}

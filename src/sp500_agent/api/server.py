@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from ..config import HORIZON_DAYS, PROJECT_ROOT, TARGET_DESCRIPTION, TRADING_DAYS_PER_YEAR
+from ..config import PRODUCTION_SPEC, PROJECT_ROOT, TRADING_DAYS_PER_YEAR
 from ..formatting import company_label, stance
 from ..research_tools import ResearchData, ResearchToolkit, ToolInputError, to_json_safe
 
@@ -47,7 +47,7 @@ PERCENTILE_SIGNALS = {
     "revenue_growth_yoy_xs_rank": "Revenue growth",
     "market_cap_xs_rank": "Size",
 }
-STRATEGY_LABELS = {"long_only": "Long top 20%", "long_short": "Long-short", "benchmark": "Equal-weight benchmark"}
+STRATEGY_LABELS = {"long_only": "Long top 20%", "long_short": "Long-short", "benchmark": "Equal-weight benchmark", "sp500": "S&P 500 (SPY)"}
 
 
 class ChatRequest(BaseModel):
@@ -101,6 +101,11 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except ValueError:
         return default
+
+
+def _spec(bundle: dict) -> dict:
+    """What the served model predicts (stored with it), falling back to the configured production setup."""
+    return bundle.get("spec") or PRODUCTION_SPEC.as_dict()
 
 
 class ResearchService:
@@ -180,7 +185,7 @@ def _records(df: pd.DataFrame | None, columns: list[str] | None = None) -> list[
 
 
 def _strategy_series(returns: pd.DataFrame) -> tuple[list[dict], list[dict]]:
-    growth = (1 + returns[list(STRATEGY_LABELS)]).cumprod()
+    growth = (1 + returns[[name for name in STRATEGY_LABELS if name in returns.columns]]).cumprod()
     drawdown = growth / growth.cummax() - 1
     dates = returns["date"]
     return (
@@ -253,8 +258,9 @@ def create_app(
         sectors = tool("sector_summary")["sectors"] if "sector" in data.scored.columns else []
         return {
             **tool("dataset_overview"),
-            "target": TARGET_DESCRIPTION,
-            "horizon_days": HORIZON_DAYS,
+            "target": _spec(data.bundle)["description"],
+            "horizon_days": _spec(data.bundle)["horizon"],
+            "spec": _spec(data.bundle),
             "model_metrics": to_json_safe({k: v for k, v in data.bundle.get("metrics", {}).items() if k in ("auc_mean", "auc_std", "ic_mean", "ic_tstat", "accuracy", "baseline_accuracy", "oos_start", "oos_end", "folds")}),
             "backtest": backtest,
             "top": tool("rank_stocks", n=10, direction="top")["stocks"],
@@ -270,7 +276,7 @@ def create_app(
         total = len(scored)
         scored["company"] = scored.apply(company_label, axis=1)
         scored["stance"] = [stance(int(r), total) for r in scored["rank"]]
-        return {"as_of": to_json_safe(scored["date"].max()), "target": TARGET_DESCRIPTION, "excluded": service.data.excluded, "stocks": _records(scored, SCREENER_FIELDS)}
+        return {"as_of": to_json_safe(scored["date"].max()), "target": _spec(service.data.bundle)["description"], "excluded": service.data.excluded, "stocks": _records(scored, SCREENER_FIELDS)}
 
     @app.get("/api/search")
     def search(q: str = Query(min_length=1, max_length=50), limit: int = 8) -> dict:
@@ -339,11 +345,12 @@ def create_app(
         if returns is None:
             raise HTTPException(404, "No backtest yet. Run python run_pipeline.py.")
         growth, drawdown = _strategy_series(returns)
-        periods_per_year = TRADING_DAYS_PER_YEAR / (artifacts.get("backtest_config") or {}).get("holding_days", HORIZON_DAYS)
+        periods_per_year = TRADING_DAYS_PER_YEAR / (artifacts.get("backtest_config") or {}).get("holding_days", _spec(service.data.bundle)["horizon"])
         rolling_ic = returns.set_index("date")["ic"].rolling(12, min_periods=6).mean().reset_index().rename(columns={"ic": "ic_rolling"})
         return {
             "config": artifacts.get("backtest_config"),
-            "labels": STRATEGY_LABELS,
+            "labels": {k: v for k, v in STRATEGY_LABELS.items() if k in returns.columns},
+            "attribution": _records(artifacts.get("attribution")),
             "periods_per_year": periods_per_year,
             "summary": _records(artifacts.get("backtest_summary")),
             "growth": growth,
@@ -360,7 +367,9 @@ def create_app(
         eda = artifacts.get("eda") or {}
         return {
             "selected": service.data.bundle.get("model_name"),
-            "target": TARGET_DESCRIPTION,
+            "target": _spec(service.data.bundle)["description"],
+            "spec": _spec(service.data.bundle),
+            "experiments": _records(artifacts.get("experiments")),
             "features": eda.get("model_features", service.data.bundle.get("numeric", [])),
             "comparison": _records(artifacts.get("model_comparison")),
             "folds": _records(artifacts.get("fold_metrics")),

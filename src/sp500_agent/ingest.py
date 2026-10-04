@@ -19,7 +19,9 @@ from .data_loader import load_fundamentals, load_news, load_prices
 
 LIVE_DIR = RAW_DIR / "live"
 DEFAULT_START = "2014-01-01"
-MAX_AGE = {"universe": timedelta(days=7), "prices": timedelta(hours=12), "fundamentals": timedelta(days=7), "macro": timedelta(hours=12)}
+MAX_AGE = {"universe": timedelta(days=7), "prices": timedelta(hours=12), "benchmark": timedelta(hours=12), "fundamentals": timedelta(days=7), "macro": timedelta(hours=12)}
+# The S&P 500 itself, for comparison: SPY's dividend-adjusted price (a total-return proxy).
+INDEX_SYMBOL = "SPY"
 EXTREME_DAILY_MOVE = 0.4
 # A former member's price history must cover at least this share of its time in the index; otherwise the
 # symbol has most likely been reused by a different company (e.g. STI: SunTrust until 2019, another firm later).
@@ -38,6 +40,7 @@ class Dataset:
     macro: pd.DataFrame | None = None
     membership: pd.DataFrame | None = None
     index_changes: pd.DataFrame | None = None
+    index_prices: pd.Series | None = None  # S&P 500 total-return proxy by date
     quality: dict = field(default_factory=dict)
 
 
@@ -112,6 +115,12 @@ def load_live(
 
     price_frame = _cached(cache_dir, "prices", {"start": start, "tickers": len(tickers), "limit": limit}, refresh, prices, log)["prices"]
     price_frame, cleaning = clean_former_members(price_frame, membership, set(current), start)
+
+    def benchmark():
+        return {"benchmark": yahoo.fetch_prices([INDEX_SYMBOL], start=start, downloader=price_downloader)}, {}
+
+    spy = _cached(cache_dir, "benchmark", {"start": start, "symbol": INDEX_SYMBOL}, refresh, benchmark, log)["benchmark"]
+    index_prices = spy.set_index("date")["adj_close"].fillna(spy.set_index("date")["close"]).rename(INDEX_SYMBOL) if not spy.empty else None
     priced = sorted(price_frame["ticker"].unique())
 
     fundamentals, sec_failures = None, {}
@@ -147,6 +156,7 @@ def load_live(
         macro=macro,
         membership=membership,
         index_changes=changes,
+        index_prices=index_prices,
     )
     meta = _read_meta(cache_dir)
     dataset.quality = data_quality(
@@ -284,6 +294,10 @@ def data_quality(dataset: Dataset, requested=None, former_members=None, membersh
 def save_dataset_extras(dataset: Dataset, directory: Path = PROCESSED_DIR) -> None:
     """Persist what the app and agent need besides the feature table."""
     directory.mkdir(parents=True, exist_ok=True)
+    if dataset.index_prices is not None:
+        dataset.index_prices.rename("close").rename_axis("date").reset_index().to_parquet(directory / "benchmark.parquet", index=False)
+    elif (directory / "benchmark.parquet").exists():
+        (directory / "benchmark.parquet").unlink()
     for name in ["fundamentals", "macro", "membership", "index_changes"]:
         frame = getattr(dataset, name)
         path = directory / f"{name}.parquet"

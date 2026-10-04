@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from sp500_agent.backtest import BacktestConfig
-from sp500_agent.config import FEATURES_PATH, MODEL_PATH, PROJECT_ROOT, RESEARCH_DIR, SAMPLE_DIR, load_environment
+from sp500_agent.config import EXPERIMENT_SPECS, FEATURES_PATH, MODEL_PATH, PRODUCTION_SPEC, PROJECT_ROOT, RESEARCH_DIR, SAMPLE_DIR, load_environment
 from sp500_agent.features import build_research_features, save_features, save_news
 from sp500_agent.ingest import DEFAULT_START, load_files, load_live, save_dataset_extras
 from sp500_agent.kaggle_loader import download_kaggle_dataset, import_from_zip
@@ -25,6 +25,7 @@ def main() -> None:
     parser.add_argument("--cost-bps", type=float, default=10.0, help="Backtest trading cost per unit of weight traded.")
     parser.add_argument("--quantile", type=float, default=0.2, help="Share of stocks held long (and short) in the backtest.")
     parser.add_argument("--max-rows", type=int, default=150_000, help="Cap on training rows per fit, for speed.")
+    parser.add_argument("--skip-experiments", action="store_true", help="Don't compare the alternative research setups.")
     args = parser.parse_args()
     load_environment()
 
@@ -62,13 +63,16 @@ def main() -> None:
     save_dataset_extras(dataset)
     print(f"Saved features to {FEATURES_PATH.relative_to(PROJECT_ROOT)} ({len(features):,} rows)")
 
-    print(f"Running {args.folds}-fold walk-forward comparison and backtest...")
+    print(f"Target: will a stock {PRODUCTION_SPEC.description}?")
+    print(f"Running {args.folds}-fold walk-forward comparison, backtest{'' if args.skip_experiments else ' and research-setup experiments'}...")
     run = run_research(
         features,
         n_splits=args.folds,
         backtest_config=BacktestConfig(cost_bps=args.cost_bps, quantile=args.quantile),
         max_rows=args.max_rows,
         quality=dataset.quality,
+        index_prices=dataset.index_prices,
+        experiment_specs=None if args.skip_experiments else EXPERIMENT_SPECS,
     )
     print(f"Saved model ({run.best_model}) to {MODEL_PATH.relative_to(PROJECT_ROOT)}")
     print(f"Saved research artifacts to {RESEARCH_DIR.relative_to(PROJECT_ROOT)}/")
@@ -79,6 +83,14 @@ def main() -> None:
     columns = ["strategy", "total_return", "cagr", "sharpe", "max_drawdown", "avg_turnover"]
     print("\nBacktest (out-of-sample, after costs):\n")
     print(run.backtest.summary[columns].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    if run.attribution is not None and not run.attribution.empty:
+        columns = [c for c in ["strategy", "alpha_annual", "alpha_tstat", "beta_MKT", "beta_SMB", "beta_HML", "beta_MOM", "r_squared"] if c in run.attribution.columns]
+        print("\nFactor attribution:\n")
+        print(run.attribution[columns].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    if run.experiments is not None:
+        columns = ["setup", "portfolio", "auc", "ic_mean", "ic_tstat", "long_only_cagr", "reference_cagr", "long_short_cagr", "long_short_alpha", "long_short_alpha_t", "turnover"]
+        print("\nResearch setups (same model, walk-forward, after costs):\n")
+        print(run.experiments[columns].to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     print(f"\nFull write-up: {(RESEARCH_DIR / 'research_report.md').relative_to(PROJECT_ROOT)}")
 
 

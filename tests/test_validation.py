@@ -43,8 +43,8 @@ def test_random_walk_has_no_skill_out_of_sample(tmp_path):
 
 def test_information_coefficient_of_a_perfect_signal_is_one():
     df = pd.DataFrame({"date": np.repeat(pd.bdate_range("2024-01-01", periods=10), 6), "ticker": list("ABCDEF") * 10})
-    df["future_return_5d"] = np.random.default_rng(0).normal(size=len(df))
-    ic = information_coefficients(df.assign(score=df["future_return_5d"] * 3), "score")
+    df["future_return"] = np.random.default_rng(0).normal(size=len(df))
+    ic = information_coefficients(df.assign(score=df["future_return"] * 3), "score")
     assert np.allclose(ic, 1.0) and len(ic) == 10
 
 
@@ -59,7 +59,7 @@ def test_ic_tstat_uses_non_overlapping_dates():
 def test_calibration_buckets_are_sorted_by_prediction():
     rng = np.random.default_rng(1)
     preds = pd.DataFrame({"probability": rng.uniform(size=1000)})
-    preds[TARGET] = (rng.uniform(size=1000) < preds["probability"]).astype(float)
+    preds["target"] = (rng.uniform(size=1000) < preds["probability"]).astype(float)
     table = calibration_table(preds)
     assert len(table) == 10 and table["rows"].sum() == 1000
     assert table["mean_predicted"].is_monotonic_increasing

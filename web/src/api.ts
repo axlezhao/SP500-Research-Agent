@@ -56,12 +56,13 @@ export interface Overview {
   model: string;
   target: string;
   horizon_days: number;
+  spec: Spec;
   data_source: string;
   data_quality: Record<string, unknown>;
   left_out_of_ranking: Record<string, string>;
   live_lookups: { news: string; sec_filings: string };
   model_metrics: { auc_mean?: Num; auc_std?: Num; ic_mean?: Num; ic_tstat?: Num; accuracy?: Num; baseline_accuracy?: Num; oos_start?: string; oos_end?: string };
-  backtest: Record<"long_only" | "long_short" | "benchmark", StrategyStats>;
+  backtest: Record<"long_only" | "long_short" | "benchmark", StrategyStats> & { sp500?: StrategyStats };
   top: RankedStock[];
   bottom: RankedStock[];
   sectors_summary?: never;
@@ -134,12 +135,54 @@ export interface Filing {
   url: string;
 }
 
+export interface Attribution {
+  strategy: string;
+  alpha_annual: number;
+  alpha_tstat: number;
+  r_squared: number;
+  periods: number;
+  [beta: string]: number | string;
+}
+
+export interface Experiment {
+  setup: string;
+  horizon: number;
+  relative_to: string;
+  portfolio: string | null;
+  production: boolean;
+  auc: Num;
+  ic_mean: Num;
+  ic_tstat: Num;
+  long_only_cagr: Num;
+  long_only_sharpe: Num;
+  reference: string | null;
+  reference_cagr: Num;
+  long_short_cagr: Num;
+  long_short_sharpe: Num;
+  long_short_alpha: Num;
+  long_short_alpha_t: Num;
+  long_only_alpha: Num;
+  long_only_alpha_t: Num;
+  turnover: Num;
+  note?: string | null;
+}
+
+export interface Spec {
+  horizon: number;
+  relative_to: string;
+  description: string;
+  label: string;
+}
+
+type StrategySeries = { date: string; long_only: number; long_short: number; benchmark: number; sp500?: number };
+
 export interface BacktestData {
-  config: { holding_days: number; quantile: number; cost_bps: number } | null;
+  config: { holding_days: number; quantile: number; cost_bps: number; neutralize?: string } | null;
   labels: Record<string, string>;
-  summary: (StrategyStats & { strategy: string })[];
-  growth: { date: string; long_only: number; long_short: number; benchmark: number }[];
-  drawdown: { date: string; long_only: number; long_short: number; benchmark: number }[];
+  summary: (StrategyStats & { strategy: string; information_ratio_vs_sp500?: Num })[];
+  growth: StrategySeries[];
+  drawdown: StrategySeries[];
+  attribution: Attribution[];
   quintiles: { quantile: number; mean_return: number; observations: number }[];
   ic: { date: string; ic: Num; ic_rolling: Num }[];
 }
@@ -147,6 +190,8 @@ export interface BacktestData {
 export interface ModelData {
   selected: string;
   target: string;
+  spec: Spec;
+  experiments: Experiment[];
   features: string[];
   comparison: { model: string; auc_mean: number; auc_std: number; accuracy: number; baseline_accuracy: number; brier: number; ic_mean: Num; ic_tstat: Num }[];
   folds: { model: string; fold: number; auc: number; test_start: string; test_end: string }[];

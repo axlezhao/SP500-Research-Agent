@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import EXECUTION_LAG_DAYS, FEATURES_PATH, HORIZON_DAYS, NEWS_PATH, TRADING_DAYS_PER_YEAR
+from .config import EXECUTION_LAG_DAYS, FEATURES_PATH, HORIZONS, NEWS_PATH, TRADING_DAYS_PER_YEAR
 
 
 POSITIVE_WORDS = {"beat", "beats", "strong", "growth", "raises", "expand", "expands", "upgrade", "bullish", "record"}
@@ -17,6 +17,9 @@ SENTIMENT_LABELS = {"positive": 1.0, "bullish": 1.0, "neutral": 0.0, "negative":
 # and the model uses their cross-sectional ranks instead (see POINT_IN_TIME_RATIOS).
 SNAPSHOT_FIELDS = ["market_cap", "pe_ratio", "revenue", "profit_margin", "debt_to_equity", "liabilities_to_equity", "roe"]
 POINT_IN_TIME_RATIOS = ["earnings_yield", "sales_yield", "book_to_market", "profit_margin", "roe", "revenue_growth_yoy", "market_cap"]
+PRICE_RANKED = ["return_20d", "momentum_60d", "momentum_12_1", "volatility_20d"]
+# Smallest group (all members, or one sector) a relative target is computed against.
+MIN_PEER_GROUP = 4
 # Fundamentals older than this (e.g. a company that stopped filing) are treated as unknown.
 MAX_FUNDAMENTALS_AGE_DAYS = 550
 # A price-to-book outside this range almost always means a share count that doesn't match the traded
@@ -89,7 +92,7 @@ def build_research_features(
 ) -> pd.DataFrame:
     """One row per ticker and trading day.
 
-    Rows in the last HORIZON_DAYS of each ticker have no target yet (target_up_5d is NaN):
+    Rows in the last `horizon` sessions of each ticker have no target for that horizon yet (NaN):
     they are excluded from training but are exactly the rows used for current predictions.
 
     Optional live inputs: point-in-time SEC fundamentals, FRED macro series, and index membership
@@ -104,6 +107,8 @@ def build_research_features(
     prices["return_5d"] = prices["close"] / by_ticker.shift(5) - 1
     prices["return_20d"] = prices["close"] / by_ticker.shift(20) - 1
     prices["momentum_60d"] = prices["close"] / by_ticker.shift(60) - 1
+    # Classic 12-1 momentum: the return from 12 months ago to 1 month ago, skipping the reversal-prone last month.
+    prices["momentum_12_1"] = by_ticker.shift(21) / by_ticker.shift(252) - 1
     prices["volatility_20d"] = prices.groupby("ticker")["return_1d"].transform(
         lambda returns: returns.rolling(20).std()
     ) * np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -111,12 +116,12 @@ def build_research_features(
     if "volume" in prices.columns:
         volume = pd.to_numeric(prices["volume"], errors="coerce")
         prices["volume_ratio_20d"] = volume / volume.groupby(prices["ticker"]).transform(lambda v: v.rolling(20).mean())
-    prices["future_return_5d"] = by_ticker.shift(-HORIZON_DAYS) / prices["close"] - 1
-    # The return a backtest can actually earn: enter EXECUTION_LAG_DAYS after the signal, hold HORIZON_DAYS.
-    prices["tradable_return_5d"] = (
-        by_ticker.shift(-(HORIZON_DAYS + EXECUTION_LAG_DAYS)) / by_ticker.shift(-EXECUTION_LAG_DAYS) - 1
-    )
-    prices["target_up_5d"] = (prices["future_return_5d"] > 0).astype(float).where(prices["future_return_5d"].notna())
+    for horizon in HORIZONS:
+        future = by_ticker.shift(-horizon) / prices["close"] - 1
+        prices[f"future_return_{horizon}d"] = future
+        # The return a backtest can actually earn: enter EXECUTION_LAG_DAYS after the signal, hold `horizon` sessions.
+        prices[f"tradable_return_{horizon}d"] = by_ticker.shift(-(horizon + EXECUTION_LAG_DAYS)) / by_ticker.shift(-EXECUTION_LAG_DAYS) - 1
+        prices[f"target_up_{horizon}d"] = (future > 0).astype(float).where(future.notna())
 
     sentiment = align_news_to_trading_days(prepare_news_sentiment(news), prices)
     prices = prices.merge(sentiment, on=["ticker", "date"], how="left")
@@ -158,13 +163,21 @@ def add_cross_sectional_features(features: pd.DataFrame) -> pd.DataFrame:
     features = features.copy()
     # Compare against the investable universe of the day: index members when membership is known.
     universe = features[features["in_index"]] if "in_index" in features.columns else features
-    columns = ["return_20d", "momentum_60d", "volatility_20d"]
+    columns = list(PRICE_RANKED)
     if "fundamentals_as_of" in features.columns:  # only point-in-time fundamentals, never the static snapshot
         columns += [col for col in POINT_IN_TIME_RATIOS if col in features.columns]
-    # Relative target: beat the median member's forward return that day (unknown for the last HORIZON_DAYS rows).
-    median_forward = universe.groupby("date")["future_return_5d"].transform("median").reindex(features.index)
-    beat = (features["future_return_5d"] > median_forward).astype(float)
-    features["target_beat_median_5d"] = beat.where(features["future_return_5d"].notna() & median_forward.notna())
+    # Relative targets: beat the median member (or the median member of the same sector) that day.
+    for horizon in HORIZONS:
+        future_col = f"future_return_{horizon}d"
+        known = features[future_col].notna()
+        groups = {"median": ["date"], "sector": ["date", "sector"]} if "sector" in features.columns else {"median": ["date"]}
+        for name, keys in groups.items():
+            grouped = universe.groupby(keys)[future_col]
+            median_forward = grouped.transform("median").reindex(features.index)
+            # A median of one or two stocks isn't a meaningful peer group (a stock can't beat itself).
+            enough = grouped.transform("count").reindex(features.index) >= MIN_PEER_GROUP
+            beat = (features[future_col] > median_forward).astype(float)
+            features[f"target_beat_{name}_{horizon}d"] = beat.where(known & median_forward.notna() & enough)
     by_date = universe.groupby("date")
     for col in columns:
         features[f"{col}_xs_rank"] = by_date[col].rank(pct=True).reindex(features.index)

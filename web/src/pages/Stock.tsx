@@ -101,6 +101,7 @@ function FilingsList({ ticker }: { ticker: string }) {
 export default function Stock() {
   const ticker = (useParams().ticker ?? "").toUpperCase();
   const detail = useQuery({ queryKey: ["stock", ticker], queryFn: () => api.stock(ticker) });
+  const overview = useQuery({ queryKey: ["overview"], queryFn: api.overview });
   const prices = useQuery({ queryKey: ["prices", ticker], queryFn: () => api.prices(ticker) });
   const fundamentals = useQuery({ queryKey: ["fundamentals", ticker], queryFn: () => api.fundamentals(ticker) });
 
@@ -140,7 +141,7 @@ export default function Stock() {
       {s?.data_warning && <Callout tone="warn">{s.data_warning}</Callout>}
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-        <Stat label="Model probability" value={s ? pct(s.model_probability) : "—"} hint="Beat the median over 5 days" />
+        <Stat label="Model probability" value={s ? pct(s.model_probability) : "—"} hint={overview.data ? `To ${overview.data.target}` : undefined} />
         <Stat label="Rank" value={s ? `${s.rank} / ${s.out_of}` : "—"} />
         <Stat label="5-day return" value={signedPct(d.latest.return_5d)} tone={tone(d.latest.return_5d)} />
         <Stat label="20-day return" value={signedPct(d.latest.return_20d)} tone={tone(d.latest.return_20d)} />

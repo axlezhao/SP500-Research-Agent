@@ -9,9 +9,9 @@ def _predictions(n_dates=60, n_tickers=20, signal=1.0, seed=0):
     rng = np.random.default_rng(seed)
     dates = pd.bdate_range("2024-01-01", periods=n_dates)
     df = pd.DataFrame({"date": np.repeat(dates, n_tickers), "ticker": [f"T{i}" for i in range(n_tickers)] * n_dates})
-    df["tradable_return_5d"] = rng.normal(0.002, 0.03, len(df))
-    df["probability"] = 0.5 + signal * df["tradable_return_5d"] + (1 - signal) * rng.normal(0, 0.03, len(df))
-    df["future_return_5d"] = df["tradable_return_5d"]
+    df["tradable_return"] = rng.normal(0.002, 0.03, len(df))
+    df["probability"] = 0.5 + signal * df["tradable_return"] + (1 - signal) * rng.normal(0, 0.03, len(df))
+    df["future_return_5d"] = df["tradable_return"]
     return df
 
 
@@ -43,7 +43,7 @@ def test_benchmark_is_equal_weight_average():
     preds = _predictions()
     result = run_backtest(preds, BacktestConfig(cost_bps=0))
     first = result.returns.iloc[0]
-    expected = preds[preds["date"] == first["date"]]["tradable_return_5d"].mean()
+    expected = preds[preds["date"] == first["date"]]["tradable_return"].mean()
     assert first["benchmark"] == pytest.approx(expected)
 
 

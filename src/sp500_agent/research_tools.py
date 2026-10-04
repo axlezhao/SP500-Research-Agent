@@ -257,12 +257,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "model_performance",
-        "description": "How good the model really is: walk-forward comparison of candidate models (AUC, accuracy vs. baseline, information coefficient), calibration, the most important features, and how single signals compare. Use whenever the user asks whether to trust the predictions.",
+        "description": "How good the model really is: walk-forward comparison of candidate models (AUC, accuracy vs. baseline, information coefficient), calibration, the most important features, how single signals compare, and the research setups that were tried (5- vs. 21-day horizons, market- vs. sector-relative targets). Use whenever the user asks whether to trust the predictions or what was tried.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "backtest_results",
-        "description": "Out-of-sample portfolio backtest of the model's rankings: long-only top quintile, long-short, and an equal-weight benchmark, with return, Sharpe, drawdown, turnover, returns by prediction quintile, and the backtest's assumptions and caveats.",
+        "description": "Out-of-sample portfolio backtest of the model's rankings: long-only top quintile, long-short, an equal-weight benchmark and the S&P 500 (SPY), with return, Sharpe, drawdown, turnover, returns by prediction quintile, a factor attribution (market, size, value, momentum betas and alpha), and the assumptions and caveats.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 ]
@@ -385,7 +385,7 @@ class ResearchToolkit:
             "sectors": sorted(self.scored["sector"].dropna().astype(str).unique()) if "sector" in self.scored else [],
             "model": bundle.get("model_name"),
             "model_trained_through": bundle.get("trained_through"),
-            "prediction_target": f"probability that the stock will {TARGET_DESCRIPTION}",
+            "prediction_target": f"probability that the stock will {(bundle.get('spec') or {}).get('description', TARGET_DESCRIPTION)}",
             "walk_forward_auc": metrics.get("auc_mean"),
             "walk_forward_ic_mean": metrics.get("ic_mean"),
             "accuracy": metrics.get("accuracy"),
@@ -642,6 +642,7 @@ class ResearchToolkit:
             "calibration": artifacts.get("calibration"),
             "top_features": importance.head(8) if importance is not None else [],
             "single_signal_ic": signals.head(8) if signals is not None else [],
+            "research_setups_tried": artifacts.get("experiments") if artifacts.get("experiments") is not None else [],
             "how_to_read": "AUC above ~0.52-0.53 and an IC t-stat above 2 (computed on non-overlapping dates) would suggest a real but small edge. Accuracy should be compared with baseline_accuracy.",
         }
 
@@ -656,9 +657,11 @@ class ResearchToolkit:
             "period": {"start": returns["date"].min(), "end": returns["date"].max(), "rebalances": len(returns)} if returns is not None else None,
             "summary": summary,
             "returns_by_prediction_quintile": artifacts.get("quantile_returns"),
+            "factor_attribution": artifacts.get("attribution") if artifacts.get("attribution") is not None else [],
             "caveats": [
                 "Survivorship bias: only current index members are in the data, which flatters long strategies.",
                 "Costs are a flat charge per unit of weight traded; no market impact or short-borrow fees.",
-                "Positions are entered one session after the signal and held for 5 sessions.",
+                "Positions are entered one session after the signal and held for the prediction horizon.",
+                "Factor attribution: alpha is the return not explained by market, size, value and momentum; |t| < 2 means it is not distinguishable from zero.",
             ],
         }
