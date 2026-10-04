@@ -1,24 +1,35 @@
-# What 12 years of S&P 500 data says about short-term stock prediction
+# Findings: short-term stock prediction on the S&P 500
 
-*Live run of 2 October 2026 · data from 2 January 2014 to 1 October 2026 · out-of-sample period May 2020 to September 2026*
+*Live run of 2 October 2026. Data from January 2014 to October 2026; out-of-sample period May 2020 to September 2026.*
 
-## The question
+## Summary
 
-Can a model built only from free public data (prices, SEC filings and macro series) rank S&P 500 stocks well enough to beat simply holding the index, after trading costs?
+**Question.** Can a model built only from free public data (prices, SEC filings and macro series) rank S&P 500 stocks well enough to beat holding the index, after trading costs?
 
-**Short answer: no.** The best ranking has a small, statistically weak edge. Before costs, its long portfolio matched the S&P 500 (17.6% a year each); weekly trading costs then put it 3.9 points a year behind. Once market, size, value and momentum exposures are accounted for, no strategy has alpha distinguishable from zero. This document explains how that was measured, what was tried, and why each attempt fell short.
+**Answer. No, not in this setup.**
+- **Ranking:** the best ranking has a small edge that isn't statistically reliable (rank IC 0.023, t = 1.85).
+- **Before costs:** a portfolio of its top 20% earned 17.6% a year, exactly matching the S&P 500.
+- **After costs:** trading it every week costs 3.8% a year, so it ends up 3.9 points a year behind.
+- **Attribution:** after accounting for market, size, value and momentum exposure, no strategy tested has alpha distinguishable from zero.
 
-## How it was tested
+The rest of this document covers how that was measured, what else was tried, and what the results do and don't show.
 
-- **Universe.** Only stocks that were S&P 500 members on each date. Membership is reconstructed from Wikipedia's change log: 758 stocks over the period. Prices exist for 98 of the 255 that left the index. The rest were delisted, so survivorship bias is reduced, not removed.
-- **Point-in-time inputs.** Price and volume signals, plus SEC fundamentals as first reported, each usable only from the day after filing. Also lagged macro data (VIX, Treasury yields) and cross-sectional ranks among the day's members. 22 model inputs in total.
-- **Walk-forward validation.** Five expanding-window folds. Each trains only on dates before its test block, with a gap as long as the prediction horizon, so no training label overlaps a test label. Every number below is out of sample.
-- **Backtest.** Rebalance every horizon. Enter one session after the signal and buy the top 20% of the ranking (long-only); long-short also shorts the bottom 20%. Costs are 10 bps per unit of weight traded. Benchmarks are SPY with dividends and an equal-weight portfolio of all members. Sharpe ratios are in excess of 3-month T-bills, except long-short, which is self-financing.
-- **Attribution.** Each strategy's returns regressed on four factors built from the same members and dates: market, size (small minus big), value (cheap minus expensive by book-to-market) and momentum (12-1 month winners minus losers).
+## Method
 
-## Result for the production setup
+| Element | Choice |
+|---|---|
+| Universe | Stocks that were S&P 500 members on each date, reconstructed from Wikipedia's change log: 758 tickers since 2014. Prices exist for 98 of the 255 that left the index. |
+| Inputs | 22 features: price and volume signals; SEC fundamentals as first reported (usable the day after filing); lagged VIX and yields; ranks among the day's members |
+| Validation | Five expanding-window walk-forward folds, with a gap as long as the prediction horizon between training and test labels. Every result below is out of sample. |
+| Models | Logistic regression, random forest, gradient boosting; selected by mean out-of-sample AUC |
+| Portfolios | Every horizon: buy the top 20% (long-only), or also short the bottom 20% (long-short). Enter one session after the signal; 10 bps cost per unit of weight traded |
+| Benchmarks | S&P 500 (SPY, dividends included) and an equal-weight portfolio of all members, over the same sessions |
+| Risk-adjusted return | Sharpe in excess of 3-month T-bills for long portfolios; raw for long-short, which is self-financing |
+| Attribution | Regression on market, size (small minus big), value (cheap minus expensive) and momentum (12-1 month) factors built from the same stocks and dates |
 
-Production setup: predict whether a stock beats the median member over the next 5 trading days. Model: logistic regression, chosen over a random forest and gradient boosting by walk-forward AUC.
+## Results: the production setup
+
+The production setup predicts whether a stock beats the median index member over the next 5 trading days. Logistic regression won the model comparison (AUC 0.511, against 0.506 for the other two).
 
 | | Total return | CAGR | Sharpe | Max drawdown |
 |---|---|---|---|---|
@@ -27,9 +38,17 @@ Production setup: predict whether a stock beats the median member over the next 
 | Equal-weight members | +141% | 15.0% | 0.78 | −20.6% |
 | **S&P 500 (SPY)** | **+178%** | **17.6%** | **0.92** | −23.2% |
 
-- **Ranking quality:** AUC 0.511 (0.5 = no skill); rank IC 0.023 with a t-stat of 1.85 (|t| ≥ 2 is the usual bar). Returns rise only gently from the bottom to the top prediction quintile, from 0.26% to 0.36% per 5 days.
+- **Ranking:** AUC 0.511, where 0.5 is no skill. Rank IC 0.023, t-stat 1.85; |t| ≥ 2 is the usual bar.
+- **Spread:** average 5-day returns rise only gently from the bottom prediction quintile (0.26%) to the top (0.36%).
 
-## What the returns really are
+**Before and after costs**
+
+| | Gross CAGR | Cost drag | Net CAGR | Turnover per week |
+|---|---|---|---|---|
+| Long top 20% | 17.6% | 3.8% | 13.8% | about a third of the book |
+| Long-short | 3.7% | 6.3% | −2.6% | both sides |
+
+**Where the returns come from**
 
 | | Alpha / year (t) | Market β | Size β | Value β | Momentum β | R² |
 |---|---|---|---|---|---|---|
@@ -38,12 +57,12 @@ Production setup: predict whether a stock beats the median member over the next 
 
 *Bold: |t| ≥ 2.*
 
-- **Long-only portfolio:** the market plus a tilt toward smaller stocks and away from value. These exposures explain 86% of its variation; what's left is slightly negative and not significant.
-- **Long-short portfolio:** mostly a bet against value stocks (β −0.68, t −9.96). The model's ranking leans toward expensive, recently strong names. That partly explains why it lagged in years when value recovered.
+- **Long-only:** the market, plus a tilt toward smaller stocks and away from value stocks. These exposures explain 86% of its variation, and the remainder isn't significant.
+- **Long-short:** above all a bet *against* value stocks (β −0.68, t −10.0). The model favours expensive, recently strong names, a costly tilt in stretches when value stocks recovered.
 
-## What was tried
+## Experiments: what else was tried
 
-The same model under each research setup, walked forward and backtested identically. The production setup was picked by a rule fixed before looking at backtests: the highest out-of-sample rank-IC t-stat.
+Each setup used the same model, validation and backtest. Production was chosen by a rule fixed before looking at any backtest: the highest out-of-sample rank-IC t-stat.
 
 | Setup | Portfolio | IC t-stat | Long-only CAGR | S&P 500 CAGR | Long-short CAGR | Long-short alpha (t) |
 |---|---|---|---|---|---|---|
@@ -53,33 +72,49 @@ The same model under each research setup, walked forward and backtested identica
 | 21-day, vs. all members | top/bottom 20% | 1.27 | 21.2% | 18.5% | +7.4% | +5.9% (1.24) |
 | 21-day, vs. own sector | sector-neutral | −0.03 | 20.9% | 18.5% | +1.2% | +0.7% (0.20) |
 
-**1. Predicting relative performance beats predicting direction.** Asking "will it go up?" mostly asks the model to forecast the market, which moves every stock together. Asking "will it beat the median member?" raised the rank IC by 40% and cut the long-short loss from −8.8% to −2.6% a year.
+**1. Predict relative performance, not direction.**
+- **Why:** "will it go up?" is mostly a question about the market, which moves every stock together.
+- **Result:** asking "will it beat the median member?" raised the rank IC by 40% and cut the long-short loss from −8.8% to −2.6% a year.
 
-**2. A monthly horizon looks better, but not convincingly.** At 21 days the long-only portfolio beat the S&P 500 (21.2% against 18.5% a year) and long-short turned positive (+7.4%). But that rests on 76 monthly rebalances. The IC t-stat is lower (1.27), and the long-short alpha (t = 1.24) and long-only alpha (+1.4% a year, t = 0.45) are not distinguishable from zero. Switching production to this setup after seeing it win the backtest would be exactly the kind of cherry-picking the selection rule exists to prevent.
+**2. A monthly horizon looks better, but not convincingly.**
+- **Result:** at 21 days, the long-only portfolio beat the S&P 500 (21.2% against 18.5% a year) and long-short turned positive (+7.4%).
+- **But:**
+  - that rests on only 76 monthly rebalances;
+  - the IC t-stat is lower (1.27);
+  - neither alpha is distinguishable from zero (long-short t = 1.24; long-only +1.4% a year, t = 0.45).
+- **Production stays at 5 days:** switching after seeing this backtest would be exactly the cherry-picking the selection rule prevents.
 
-**3. Comparing within sectors made things worse.** Sector-neutral portfolios remove the bet on which sectors do well. The 5-day sector-neutral long-short lost 10.7% a year of alpha, which is significant (t = −2.86), and its ranking quality was the weakest. Whatever little signal the model has seems to come from cross-sector differences such as size and value, which the sector-neutral version strips out, while it still pays the trading costs.
+**3. Comparing within sectors made it worse.**
+- **What it does:** sector-neutral portfolios remove any bet on which sectors do well.
+- **Result:** at 5 days, the long-short lost 10.7% a year of alpha, the only significant result in the table, and a negative one.
+- **Why:** the little signal the model has seems to come from differences *across* sectors (size and value), which this construction strips out while still paying for the trading.
 
-**4. Costs explain the whole shortfall.** Before costs, the 5-day long-only portfolio earned 17.6% a year, the same as the S&P 500, and long-short earned +3.7% a year. But the long-only book replaces about a third of its holdings every week, and at 10 bps per unit traded that costs 3.8% a year (6.3% for long-short, which trades both sides). After costs, long-only trails the index by 3.9 points and long-short loses money. A weak signal at a weekly rebalance can't pay for its own trading.
+**4. At a weekly rebalance, costs decide the outcome.**
+- **The arithmetic:** the long book replaces about a third of its holdings every week, which at 10 bps costs 3.8% a year. That is larger than any edge the ranking provides.
 
-**5. The strongest single inputs are known effects, and both are weak here.** Last week's return has a negative IC (−0.015): recent losers tend to bounce relative to recent winners (short-term reversal). 12-1 month momentum has a positive IC (+0.014). Neither has a t-stat above 1.1 on its own; the model combines them into something only slightly better (0.023, t = 1.85).
+**5. The strongest single inputs are known effects, and weak here.**
+- **Short-term reversal:** last week's return has an IC of −0.015; recent losers tend to bounce relative to recent winners.
+- **Momentum:** 12-1 month momentum has an IC of +0.014.
+- **Together:** neither reaches a t-stat of 1.1 on its own; the model combines them into something only slightly better.
 
-## Caveats
+## Limitations
 
-- **Survivorship bias.** 157 former members have no usable prices, mostly companies acquired or delisted. Missing failures flatter every long strategy and the benchmarks alike.
-- **Multiple testing.** Three models and five setups were compared. With that many tries, a t-stat around 1.9 is what chance alone can produce.
-- **Simplified costs.** A flat 10 bps per unit traded, with no market impact or short-borrow fees. Real long-short costs would be higher.
-- **One period.** The out-of-sample window (2020–2026) includes a crash, a rate-hiking cycle and long stretches when the largest stocks led the market, which hurts a portfolio tilted toward smaller stocks. Other periods could look different.
+- **Survivorship bias.** 157 former members have no usable prices, mostly acquired or delisted companies. Missing failures flatter every long strategy and the benchmarks.
+- **Multiple testing.** Three models and five setups were compared. With that many tries, a t-stat near 1.9 is within what chance can produce.
+- **Simplified costs.** A flat 10 bps per unit traded; no market impact or short-borrow fees, so real long-short costs would be higher.
+- **One period.** 2020–2026 included a crash, a rate-hiking cycle and long stretches when the largest stocks led the market, which hurts a small-cap tilt. Another period could look different.
+- **Free data.** Yahoo prices are unofficial and occasionally miss corporate actions; SEC XBRL tagging varies between companies.
 
-## Takeaways
+## Lessons
 
-- A careful pipeline matters more than a clever model. The project's first version reported AUC 0.69 on random-walk data because of a random train/test split. Every honest number since has been close to 0.5.
-- Public price and fundamental data, used in standard ways, does not produce a short-term edge in large US stocks after costs. That is consistent with the efficient-markets literature and with how competitive this corner of the market is.
-- The useful output here is the measurement, not the ranking: walk-forward validation, point-in-time data, realistic execution, and attribution against known factors.
+- **Measurement matters more than the model.** The project's first version reported AUC 0.69 on random-walk data because of a random train/test split. Every honest number since has been close to 0.5.
+- **No easy edge.** Public price and fundamental data, used in standard ways, doesn't produce a short-term edge in large US stocks after costs. That's consistent with how competitive this market is.
+- **The process is the reusable part.** Point-in-time data, walk-forward validation, realistic execution, a pre-committed selection rule and factor attribution apply to any signal worth testing.
 
 ## Reproduce
 
 ```bash
-python run_pipeline.py          # live data; writes reports/research/research_report.md with these tables
+python run_pipeline.py
 ```
 
-Results change as new data arrives. The selection rule and the setups compared are fixed in `src/sp500_agent/config.py` (`PRODUCTION_SPEC`, `EXPERIMENT_SPECS`).
+The run writes `reports/research/research_report.md` with these tables, regenerated from the latest data, so numbers drift as new data arrives. The setups and the selection rule are defined in `src/sp500_agent/config.py` (`PRODUCTION_SPEC`, `EXPERIMENT_SPECS`).
