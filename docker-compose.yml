@@ -1,0 +1,24 @@
+# docker compose up --build      -> http://localhost:8000 (set HOST_PORT to use another port)
+# Settings and keys come from .env (see .env.example). Downloaded data persists in named volumes.
+services:
+  app:
+    build: .
+    image: sp500-research
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_SOURCE: ${DATA_SOURCE:-live}
+      PIPELINE_ARGS: ${PIPELINE_ARGS:-}
+    volumes:
+      - data:/app/data
+      - models:/app/models
+      - reports:/app/reports
+    restart: unless-stopped
+
+volumes:
+  data:
+  models:
+  reports:

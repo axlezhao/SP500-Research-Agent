@@ -9,3 +9,9 @@ models/
 reports/
 *.joblib
 .streamlit/
+.pytest_cache/
+*.egg-info/
+build/
+web/node_modules/
+web/dist/
+*.tsbuildinfo

@@ -1,93 +1,95 @@
-# S&P 500 AI Research Agent
+# S&P 500 Research Agent
 
-Educational data science project using S&P 500 prices, financials, and news.
+[![CI](https://github.com/axlezhao/SP500-Research-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/axlezhao/SP500-Research-Agent/actions/workflows/ci.yml)
 
-Dataset:
+An end-to-end research platform for S&P 500 stocks, built entirely on free public data. It brings together three disciplines in one codebase:
 
-https://www.kaggle.com/datasets/sadiqguru/s-and-p-500-stock-data-along-with-financials-and-news
+- **Data science:** point-in-time features from prices, SEC filings and macro data, with three models compared by walk-forward validation.
+- **Quant research:** an out-of-sample portfolio backtest against the S&P 500, with trading costs and a four-factor attribution.
+- **AI agent:** an LLM (DeepSeek or Claude) that answers research questions by calling 15 tools over the data, the model, the backtest, and live news and SEC filings.
 
-## Setup
+All of it is served through a web dashboard: a FastAPI backend and a React + TypeScript frontend.
 
-Install dependencies:
+![Tour of the dashboard: overview, stock page, the research agent answering live, backtest and model lab](docs/media/tour.gif)
+
+## What it found
+
+Can free public data rank S&P 500 stocks well enough to beat the index after costs? **Not in this setup.** Over May 2020 to September 2026, out of sample:
+
+| Portfolio (5-day rebalance) | CAGR | Sharpe | Alpha vs. 4 factors (t) |
+|---|---|---|---|
+| Model's top 20% | 13.8% | 0.62 | −2.8% (−1.0) |
+| Long top 20%, short bottom 20% | −2.6% | −0.10 | −1.5% (−0.4) |
+| S&P 500 (SPY) | 17.6% | 0.92 | — |
+
+- **Costs explain the gap.** Before costs, the top-20% portfolio earned 17.6% a year, the same as the index; trading every week then costs 3.8% a year.
+- **Other setups don't change that.** A monthly horizon and sector-neutral portfolios were also tested; none shows alpha distinguishable from zero.
+
+[Read the full findings →](docs/FINDINGS.md)
+
+## Quick start
+
+With Docker (nothing else to install):
+
+```bash
+cp .env.example .env          # set SEC_USER_AGENT (a contact email SEC requires); an LLM key is optional
+docker compose up --build     # first start downloads and builds the data (~4 min), then serves the dashboard
+```
+
+Open http://localhost:8000. For an instant start on synthetic data, use `DATA_SOURCE=sample docker compose up --build`.
+
+Without Docker (Python 3.11+, Node 20+):
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env
+python run_pipeline.py                            # download data, run the research, train the model
+cd web && npm install && npm run build && cd ..   # build the dashboard
+sp500-web                                         # http://127.0.0.1:8000
 ```
 
-Set up Kaggle credentials if you have not already:
+See the [user guide](docs/GUIDE.md) for configuration, the agent and troubleshooting.
 
-1. Go to your Kaggle account settings.
-2. Create an API token.
-3. Put `kaggle.json` in `~/.kaggle/kaggle.json`.
+## Highlights
 
-## Download the Dataset Automatically
+**Data**
+- **Five free sources:** Wikipedia (index membership history), Yahoo Finance (prices), SEC EDGAR (fundamentals and filings), FRED (VIX, Treasury yields), and Yahoo RSS or Finnhub (news). All cached, with a data-quality report.
+- **No look-ahead:** SEC figures are used as first reported, only from the day after filing. The model trains and trades only on stocks that were index members on each date.
+- **Data cleaning:** recycled tickers, such as SunTrust's old symbol now used by another company, are detected and dropped. Unadjusted corporate actions are flagged.
 
-Download all dataset files into `data/raw/`:
+**Research**
+- **Walk-forward validation** with a gap as long as the prediction horizon.
+- **Model comparison:** logistic regression, random forest and gradient boosting, plus calibration, permutation importance and single-signal information coefficients.
+- **Five research setups** compared on every run: 5- or 21-day horizon, and beating the market, beating the stock's own sector, or simply rising. Production is chosen by a rule fixed in advance, so backtests can't be cherry-picked.
+- **Backtest:** next-day execution, costs, an optional sector-neutral construction, the S&P 500 and an equal-weight benchmark. Attribution splits returns into market, size, value and momentum exposure, and alpha.
 
-```bash
-python download_kaggle.py
-```
+**Agent and app**
+- **Research agent:** 15 tools including point-in-time fundamentals, live SEC filings and news, market conditions and the model's own evidence. Prompted to ground every number in a tool result and to state the model's limits.
+- **Dashboard:** overview, screener, stock pages with TradingView charts, a chat that streams each tool call as it happens, and backtest, model and data views. Light and dark themes, ⌘K search, works on phones.
+- **Engineering:** 142 offline tests; GitHub Actions runs them, builds the dashboard and smoke-tests the Docker image. A demo mode caps LLM cost for public deployments.
 
-Or download and run the project pipeline in one command:
+## Screenshots
 
-```bash
-python run_pipeline.py --download-kaggle
-```
+| | |
+|---|---|
+| ![Overview](docs/media/overview.png) | ![Stock page](docs/media/stock.png) |
+| ![Research agent](docs/media/agent.png) | ![Backtest](docs/media/backtest.png) |
+| ![Model lab](docs/media/model-lab.png) | ![Screener](docs/media/screener.png) |
 
-Kaggle datasets are static files, not live online SQL databases. KaggleHub's pandas DataFrame option still downloads file bytes over HTTPS, so the data must exist locally at least temporarily.
+## Documentation
 
-If KaggleHub fails with an SSL error from `storage.googleapis.com`, download the dataset ZIP from Kaggle in your browser, then run:
+| Document | What's in it |
+|---|---|
+| [User guide](docs/GUIDE.md) | Installation, data sources and keys, pipeline options, the dashboard, the agent, troubleshooting |
+| [Architecture](docs/ARCHITECTURE.md) | How data flows, the point-in-time rules, modelling and validation, backtest and attribution, agent design, API, tests |
+| [Findings](docs/FINDINGS.md) | The research question, method, results, everything that was tried and why it fell short |
+| [Deployment](docs/DEPLOY.md) | Putting a public demo online, and the data-licensing and cost decisions involved |
+| [Roadmap](docs/ROADMAP.md) | What's done and what could come next |
 
-```bash
-python download_kaggle.py --from-zip ~/Downloads/archive.zip
-```
+## Tech stack
 
-Or import the ZIP and run the pipeline in one command:
+**Python:** pandas, scikit-learn, FastAPI, yfinance, requests, the OpenAI SDK (for DeepSeek) and the Anthropic SDK. **Frontend:** React 19, TypeScript, Vite, Tailwind CSS 4, TanStack Query, Recharts, TradingView Lightweight Charts. **Ops:** Docker, GitHub Actions, pytest.
 
-```bash
-python run_pipeline.py --from-zip ~/Downloads/archive.zip
-```
+---
 
-If you only want to test the project without Kaggle credentials:
-
-```bash
-python run_pipeline.py --make-sample
-```
-
-## Run the Agent
-
-After the pipeline has created features and trained the baseline model:
-
-```bash
-python -m src.sp500_agent.agent --ticker AAPL
-```
-
-This writes a markdown research brief to `reports/`.
-
-## What the Project Does
-
-- Downloads the full Kaggle dataset with KaggleHub.
-- Copies all CSV files into `data/raw/`.
-- Tries to infer which file contains prices, fundamentals, and news.
-- Engineers returns, volatility, momentum, sentiment, and fundamentals.
-- Trains a baseline 5-day return direction model.
-- Generates an analyst-style research brief.
-
-This project is for education and research only. It is not financial advice.
-
-
-
-## Chatbot GUI
-
-Run the presentation-friendly chatbot app:
-
-```bash
-streamlit run streamlit_app.py
-```
-
-Try prompts like:
-
-- `Analyze NVDA`
-- `Top 10 stocks`
-- `Weakest 10 stocks`
-- `Compare the model view for AAPL`
+For education and research only. Nothing here is investment advice.
