@@ -15,7 +15,7 @@ PALETTE = {
     "dark": {"series": ["#3987e5", "#d95926", "#199e70"], "muted": "#8f8e88"},
 }
 STRATEGY_LABELS = {"long_only": "Long top 20%", "long_short": "Long-short", "benchmark": "Benchmark"}
-MODEL_LABELS = {"logistic_regression": "Logistic regression", "random_forest": "Random forest", "gradient_boosting": "Gradient boosting"}
+MODEL_LABELS = {"logistic_regression": "Logistic regression", "ridge": "Ridge regression", "random_forest": "Random forest", "gradient_boosting": "Gradient boosting", "composite": "Anomaly composite"}
 HEIGHT = 300
 
 

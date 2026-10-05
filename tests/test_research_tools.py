@@ -146,7 +146,8 @@ def test_call_validates_arguments(toolkit):
 
 def test_model_and_backtest_tools_report_the_evidence(toolkit):
     perf = toolkit.call("model_performance", {})
-    assert len(perf["model_comparison"]) == 3 and perf["calibration"]
+    assert len(perf["model_comparison"]) == 4 and perf["calibration"]
+    assert perf["overfitting_checks"]["trials_counted"] >= 4
     backtest = toolkit.call("backtest_results", {})
     assert {row["strategy"] for row in backtest["summary"]} == {"long_only", "long_short", "benchmark"}
     assert any("Survivorship" in c for c in backtest["caveats"])

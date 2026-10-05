@@ -74,23 +74,24 @@ def test_kaggle_snapshot_fundamentals_are_never_ranked(sample_features):
 
 
 def test_training_scoring_and_validation_use_index_members_only(live_features):
-    bundle = train_final_model(live_features, "logistic_regression", model_path=None)
-    assert "earnings_yield_xs_rank" in bundle["numeric"] and "vix" in bundle["numeric"]
+    bundle = train_final_model(live_features, "ridge", model_path=None)
+    assert "earnings_yield_z" in bundle["numeric"] and "vix_regime" in bundle["numeric"]
+    assert not any(col in bundle["numeric"] for col in ["vix", "return_5d", "earnings_yield"])  # raw scales never enter
     scored = score_latest(live_features, bundle)
     assert "T12" not in set(scored["ticker"]) and "T13" in set(scored["ticker"])  # T12 left the index, T13 joined
-    predictions = walk_forward(live_features, "logistic_regression", n_splits=3).predictions
+    predictions = walk_forward(live_features, "ridge", n_splits=3).predictions
     members = live_features.loc[live_features["in_index"], ["ticker", "date"]]
     assert len(predictions.merge(members, on=["ticker", "date"])) == len(predictions)
 
 
 def test_available_features_skips_sparse_and_constant_columns():
     df = pd.DataFrame({
-        "return_5d": np.arange(10.0),
-        "vix": [1.0] * 10,  # constant
-        "sentiment_20d": [np.nan] * int(10 * MAX_MISSING_SHARE + 1) + [0.1] * (10 - int(10 * MAX_MISSING_SHARE + 1)),  # mostly missing
+        "return_5d_z": np.arange(10.0),
+        "vix_regime": [1.0] * 10,  # constant
+        "sentiment_20d_z": [np.nan] * int(10 * MAX_MISSING_SHARE + 1) + [0.1] * (10 - int(10 * MAX_MISSING_SHARE + 1)),  # mostly missing
     })
     numeric, _ = available_features(df)
-    assert numeric == ["return_5d"]
+    assert numeric == ["return_5d_z"]
 
 
 def test_backtest_sharpe_is_in_excess_of_cash():
@@ -129,7 +130,7 @@ def test_suspect_recent_moves_are_left_out_of_the_ranking(live_features):
     features = live_features.copy()
     last = features.index[(features["ticker"] == "T05") & (features["date"] == features["date"].max())]
     features.loc[last, "return_1d"] = -0.84
-    bundle = train_final_model(features, "logistic_regression", model_path=None)
+    bundle = train_final_model(features, "ridge", model_path=None)
     scored = score_latest(features, bundle)
     assert "T05" not in set(scored["ticker"]) and "-84%" in scored.attrs["excluded"]["T05"]
     assert scored["rank"].tolist() == list(range(1, len(scored) + 1))

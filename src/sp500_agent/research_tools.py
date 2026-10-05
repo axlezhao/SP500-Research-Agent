@@ -39,6 +39,13 @@ MAX_COMPARE = 8
 CHART_POINTS = 60
 
 
+def _robustness_summary(robustness: dict | None) -> dict:
+    if not robustness:
+        return {}
+    keep = ["trials_counted", "long_short", "long_only_vs_equal_weight", "pbo", "breakeven_cost", "alpha_confidence", "setup_with_highest_ic_tstat"]
+    return {k: robustness[k] for k in keep if k in robustness}
+
+
 class ToolInputError(ValueError):
     """Raised for bad tool arguments; the message is returned to the model so it can correct itself."""
 
@@ -636,14 +643,22 @@ class ResearchToolkit:
             return {"note": "No research artifacts found. Run python run_pipeline.py to produce them.", "metrics": self.data.bundle.get("metrics", {})}
         importance = artifacts.get("feature_importance")
         signals = artifacts.get("signal_ic")
+        decay = artifacts.get("ic_decay")
+        columns = [c for c in ["model", "ic_mean", "ic_tstat", "ic_tstat_nonoverlap", "auc_mean", "auc_std", "accuracy", "baseline_accuracy", "brier"] if c in comparison.columns]
         return {
             "selected_model": self.data.bundle.get("model_name"),
-            "model_comparison": comparison[["model", "auc_mean", "auc_std", "accuracy", "baseline_accuracy", "brier", "ic_mean", "ic_tstat"]],
+            "hyperparameters": self.data.bundle.get("params"),
+            "model_comparison": comparison[columns],
             "calibration": artifacts.get("calibration"),
             "top_features": importance.head(8) if importance is not None else [],
             "single_signal_ic": signals.head(8) if signals is not None else [],
+            "ic_by_year_sector_and_size": artifacts.get("ic_breakdown") if artifacts.get("ic_breakdown") is not None else [],
+            "ic_decay_by_horizon": decay[decay["signal"] == "model_probability"] if decay is not None else [],
             "research_setups_tried": artifacts.get("experiments") if artifacts.get("experiments") is not None else [],
-            "how_to_read": "AUC above ~0.52-0.53 and an IC t-stat above 2 (computed on non-overlapping dates) would suggest a real but small edge. Accuracy should be compared with baseline_accuracy.",
+            "overfitting_checks": _robustness_summary(artifacts.get("robustness")),
+            "how_to_read": "Models are ranked by the rank IC's Newey-West t-stat (|t| > 2 suggests a real but small edge). "
+            "The composite is a fixed-sign blend of known anomalies: a fitted model that can't beat it adds nothing. "
+            "A deflated Sharpe below 0.95 or a probability of backtest overfitting near 0.5 means the best backtest is consistent with luck.",
         }
 
     def backtest_results(self) -> dict:
@@ -657,11 +672,17 @@ class ResearchToolkit:
             "period": {"start": returns["date"].min(), "end": returns["date"].max(), "rebalances": len(returns)} if returns is not None else None,
             "summary": summary,
             "returns_by_prediction_quintile": artifacts.get("quantile_returns"),
+            "portfolio_constructions": artifacts.get("constructions") if artifacts.get("constructions") is not None else [],
+            "net_cagr_by_cost_level": artifacts.get("cost_sensitivity") if artifacts.get("cost_sensitivity") is not None else [],
+            "results_by_rebalance_day": artifacts.get("staggered") if artifacts.get("staggered") is not None else [],
+            "bootstrap_95pct_intervals": artifacts.get("bootstrap") if artifacts.get("bootstrap") is not None else [],
             "factor_attribution": artifacts.get("attribution") if artifacts.get("attribution") is not None else [],
+            "fama_french_attribution": artifacts.get("french_attribution") if artifacts.get("french_attribution") is not None else [],
+            "overfitting_checks": _robustness_summary(artifacts.get("robustness")),
             "caveats": [
-                "Survivorship bias: only current index members are in the data, which flatters long strategies.",
-                "Costs are a flat charge per unit of weight traded; no market impact or short-borrow fees.",
+                "Survivorship bias: former index members without price data are missing, which flatters long strategies. Stocks that stop trading are kept to their last price.",
+                "Costs are estimated per stock from daily highs and lows (half the estimated spread) or a flat charge; no market impact.",
                 "Positions are entered one session after the signal and held for the prediction horizon.",
-                "Factor attribution: alpha is the return not explained by market, size, value and momentum; |t| < 2 means it is not distinguishable from zero.",
+                "Factor attribution: alpha is the return not explained by the factors; |t| < 2 (Newey-West) means it is not distinguishable from zero.",
             ],
         }

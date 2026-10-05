@@ -34,7 +34,7 @@ export default function Dashboard() {
   const bt = o.backtest;
   const vix = o.macro?.series.vix;
   const spread = o.macro?.series.term_spread;
-  const edge = (m.ic_tstat ?? 0) > 2 && (m.auc_mean ?? 0) > 0.52;
+  const edge = (m.ic_tstat ?? 0) > 2;
   const open = (r: RankedStock) => navigate(`/stock/${r.ticker}`);
 
   return (
@@ -51,7 +51,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         <Stat label="Stocks ranked" value={o.stocks_ranked} hint={Object.keys(o.left_out_of_ranking).length ? `${Object.keys(o.left_out_of_ranking).length} left out (data warnings)` : "Index members today"} />
         <Stat label="Walk-forward AUC" value={num(m.auc_mean, 3)} hint="0.500 = no skill" help="Area under the ROC curve on out-of-sample folds." />
-        <Stat label="Rank IC" value={num(m.ic_mean, 3)} hint={`t-stat ${num(m.ic_tstat, 2)}`} help="Average daily rank correlation between prediction and realised 5-day return; t-stat from non-overlapping dates." />
+        <Stat label="Rank IC" value={num(m.ic_mean, 3)} hint={`t-stat ${num(m.ic_tstat, 2)}`} help="Average daily rank correlation between the model's score and the realised return; Newey-West t-stat, corrected for overlapping return windows." />
         <Stat label="Long top 20%" value={signedPct(bt.long_only?.total_return, 0)} tone={tone(bt.long_only?.total_return)} hint={bt.sp500 ? `S&P 500 ${signedPct(bt.sp500.total_return, 0)}` : `Benchmark ${signedPct(bt.benchmark?.total_return, 0)}`} />
         <Stat label="Long-short Sharpe" value={num(bt.long_short?.sharpe, 2)} tone={tone(bt.long_short?.sharpe)} hint="After costs, out of sample" />
         <Stat label="VIX" value={num(vix?.latest, 1)} hint={vix?.percentile_10y != null ? `${Math.round(vix.percentile_10y * 100)}th pct. of 10 years` : undefined} />

@@ -26,7 +26,7 @@ def test_folds_are_ordered_contiguous_and_embargoed():
 
 
 def test_predictions_are_out_of_sample(sample_features):
-    result = walk_forward(sample_features, "logistic_regression", n_splits=3)
+    result = walk_forward(sample_features, "ridge", n_splits=3)
     folds = result.fold_metrics.set_index("fold")
     merged = result.predictions.join(folds[["train_end", "test_start"]], on="fold")
     assert (merged["date"] > merged["train_end"]).all()
@@ -48,12 +48,17 @@ def test_information_coefficient_of_a_perfect_signal_is_one():
     assert np.allclose(ic, 1.0) and len(ic) == 10
 
 
-def test_ic_tstat_uses_non_overlapping_dates():
+def test_ic_tstat_corrects_for_overlapping_windows():
     ic = pd.Series(np.r_[np.full(50, 0.1), np.full(50, 0.3)] + np.tile([0.01, -0.01], 50))
     summary = ic_summary(ic, step=5)
     assert summary["ic_days"] == 100
     independent = ic.iloc[::5]
-    assert np.isclose(summary["ic_tstat"], independent.mean() / independent.std() * np.sqrt(len(independent)))
+    assert np.isclose(summary["ic_tstat_nonoverlap"], independent.mean() / independent.std() * np.sqrt(len(independent)))
+    # Overlapping 5-day windows make daily ICs autocorrelated: Newey-West shrinks the naive t-stat.
+    rng = np.random.default_rng(0)
+    overlapping = pd.Series(np.convolve(rng.normal(0.01, 0.1, 2000), np.ones(5) / 5, mode="valid"))
+    naive = overlapping.mean() / overlapping.std() * np.sqrt(len(overlapping))
+    assert ic_summary(overlapping, step=5)["ic_tstat"] < 0.6 * naive
 
 
 def test_calibration_buckets_are_sorted_by_prediction():

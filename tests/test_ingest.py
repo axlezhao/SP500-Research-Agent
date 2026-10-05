@@ -40,6 +40,10 @@ class FakeSec:
         self.calls += 1
         if "company_tickers" in url:
             return {"0": {"ticker": "OLD", "cik_str": 4}, "1": {"ticker": "AAA", "cik_str": 1}}
+        if "submissions" in url:
+            return {"sic": "2834" if "CIK0000000004" in url else "7372", "sicDescription": "x", "filings": {"recent": {
+                "form": ["8-K"], "filingDate": ["2022-04-28"], "acceptanceDateTime": ["2022-04-28T16:05:00.000Z"], "items": ["2.02"],
+            }}}
         return _company_facts()
 
 
@@ -86,6 +90,11 @@ def test_load_live_builds_a_clean_dataset(live):
     assert old["date"].max() <= pd.Timestamp("2022-06-01") + pd.Timedelta(days=ingest.POST_REMOVAL_DAYS)
     assert {"close", "raw_close", "volume"} <= set(data.prices.columns)
     assert set(data.fundamentals["ticker"]) == {"AAA", "BRK.B", "NEW", "OLD"}  # CIKs from Wikipedia, or SEC for OLD
+    companies = data.companies.set_index("ticker")
+    assert companies.loc["OLD", "sector"] == "Health Care"  # from its SIC code: no "Unknown" flag for former members
+    assert companies.loc["AAA", "sector"] == "Tech" and companies.loc["AAA", "industry"] == "SIC 73"
+    assert set(data.earnings_dates["date"]) == {pd.Timestamp("2022-04-29")}  # after the close: next day
+    assert data.eps is not None and data.delistings is not None
     assert data.macro["term_spread"].notna().any()
     quality = data.quality
     assert quality["survivorship"]["former_members"] == 2  # OLD and GONE (ANCIENT left before the start)

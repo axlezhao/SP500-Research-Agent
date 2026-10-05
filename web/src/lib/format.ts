@@ -34,8 +34,10 @@ export const tone = (v: Num | undefined) => (missing(v) || v === 0 ? "text-text"
 
 export const MODEL_LABELS: Record<string, string> = {
   logistic_regression: "Logistic regression",
+  ridge: "Ridge regression",
   random_forest: "Random forest",
   gradient_boosting: "Gradient boosting",
+  composite: "Anomaly composite (baseline)",
 };
 
 export const FEATURE_LABELS: Record<string, string> = {
@@ -60,8 +62,39 @@ export const FEATURE_LABELS: Record<string, string> = {
   market_cap_xs_rank: "Size (rank)",
   vix: "VIX",
   vix_change_20d: "VIX 20-day change",
+  vix_regime: "VIX vs. its past year",
   term_spread: "Yield-curve spread",
   sector: "Sector",
   model_probability: "Model",
+  momentum_12_1: "12-1 month momentum",
+  return_5d_vs_industry: "5-day return vs. industry (reversal)",
+  return_20d_vs_industry: "20-day return vs. industry",
+  industry_momentum: "Industry momentum",
+  beta_252: "Market beta",
+  idio_vol_63: "Idiosyncratic volatility",
+  residual_momentum: "Residual momentum",
+  max_return_21: "Largest daily gain, past month",
+  high_52w: "Price vs. 52-week high",
+  earnings_yield: "Earnings yield",
+  sales_yield: "Sales yield",
+  book_to_market: "Book-to-market",
+  profit_margin: "Profit margin",
+  roe: "ROE",
+  revenue_growth_yoy: "Revenue growth",
+  market_cap: "Size",
+  gross_profitability: "Gross profitability",
+  accruals: "Accruals",
+  asset_growth: "Asset growth",
+  net_issuance: "Net share issuance",
+  sue: "Earnings surprise (SUE)",
+  ear: "Earnings-announcement return",
+  insider_purchases_90d: "Insider purchases",
+  insider_net_value_90d: "Insider net buying",
+  reversal_x_vix: "Reversal × VIX regime",
+  momentum_x_vix: "Momentum × VIX regime",
 };
-export const featureLabel = (name: string) => FEATURE_LABELS[name] ?? name.replace(/^(cat|num)__/, "").replace(/_/g, " ");
+export const featureLabel = (name: string) => {
+  const base = name.replace(/^(cat|num)__/, "");
+  const raw = base.endsWith("_z") ? base.slice(0, -2) : base;
+  return FEATURE_LABELS[base] ?? FEATURE_LABELS[raw] ?? base.replace(/_/g, " ");
+};

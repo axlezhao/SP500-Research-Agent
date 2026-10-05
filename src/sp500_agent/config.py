@@ -26,27 +26,50 @@ KAGGLE_DIR_NAME = "kaggle_sp500_dataset"
 
 # Forward-return horizons computed for every row, in trading days (about a week and a month).
 HORIZONS = (5, 21)
+# Horizons for the IC decay diagnostic: how long a signal's predictive power lasts.
+DECAY_HORIZONS = (1, 2, 5, 10, 21, 42, 63)
 
 
 @dataclass(frozen=True)
 class ResearchSpec:
     """What the model predicts.
 
-    horizon: trading days ahead. relative_to: "market" = beat the median index member that day;
-    "sector" = beat the median member of the same sector; "absolute" = the price rises.
+    horizon: trading days ahead. relative_to: "market" = against every index member that day;
+    "sector" = against members of the same sector; "absolute" = whether the price rises.
+    target: "binary" = beat the median (a yes/no label); "rank" = the stock's percentile rank among
+    its peers by volatility-scaled forward return (0 to 1). A model of the rank predicts the expected
+    percentile, which equals the probability of beating a randomly chosen peer, so it keeps magnitude
+    information that the yes/no label throws away.
     """
 
     horizon: int = 5
     relative_to: str = "market"
+    target: str = "binary"
 
     def __post_init__(self) -> None:
         if self.horizon not in HORIZONS:
             raise ValueError(f"horizon must be one of {HORIZONS}")
         if self.relative_to not in ("market", "sector", "absolute"):
             raise ValueError("relative_to must be market, sector or absolute")
+        if self.target not in ("binary", "rank"):
+            raise ValueError("target must be binary or rank")
+        if self.target == "rank" and self.relative_to == "absolute":
+            raise ValueError("a rank target is always relative: use relative_to market or sector")
+
+    @property
+    def is_rank(self) -> bool:
+        return self.target == "rank"
 
     @property
     def target_column(self) -> str:
+        if self.is_rank:
+            return f"target_rank_{self.relative_to}_{self.horizon}d"
+        prefix = {"market": "target_beat_median", "sector": "target_beat_sector", "absolute": "target_up"}[self.relative_to]
+        return f"{prefix}_{self.horizon}d"
+
+    @property
+    def binary_column(self) -> str:
+        """The yes/no label for the same comparison, used for AUC and calibration whatever the training target."""
         prefix = {"market": "target_beat_median", "sector": "target_beat_sector", "absolute": "target_up"}[self.relative_to]
         return f"{prefix}_{self.horizon}d"
 
@@ -60,6 +83,9 @@ class ResearchSpec:
 
     @property
     def description(self) -> str:
+        if self.is_rank:
+            peers = "a randomly chosen S&P 500 member" if self.relative_to == "market" else "a randomly chosen member of its sector"
+            return f"beat {peers} over the next {self.horizon} trading days, after scaling for volatility"
         return {
             "market": f"beat the median S&P 500 stock over the next {self.horizon} trading days",
             "sector": f"beat the median stock in its sector over the next {self.horizon} trading days",
@@ -68,22 +94,24 @@ class ResearchSpec:
 
     @property
     def label(self) -> str:
-        return f"{self.horizon}-day, " + {"market": "vs. all members", "sector": "vs. own sector", "absolute": "up or down"}[self.relative_to]
+        peers = {"market": "vs. all members", "sector": "vs. own sector", "absolute": "up or down"}[self.relative_to]
+        return f"{self.horizon}-day, {peers}" + (", ranked" if self.is_rank else "")
 
     def as_dict(self) -> dict:
-        return {"horizon": self.horizon, "relative_to": self.relative_to, "description": self.description, "label": self.label}
+        return {"horizon": self.horizon, "relative_to": self.relative_to, "target": self.target, "description": self.description, "label": self.label}
 
 
-# The setup the pipeline trains and the app serves. Chosen by the experiments in run_pipeline.py
-# (highest out-of-sample rank-IC t-stat); see docs/FINDINGS.md.
-PRODUCTION_SPEC = ResearchSpec(horizon=5, relative_to="market")
-# The setups compared in every research run.
+# The setup the pipeline trains and the app serves: the ranked, volatility-scaled 5-day target against
+# all members. Fixed before the new experiments were run; the selection rule below is reported next to it.
+PRODUCTION_SPEC = ResearchSpec(horizon=5, relative_to="market", target="rank")
+# The setups compared in every research run: the original yes/no labels, then the ranked targets.
 EXPERIMENT_SPECS = (
     ResearchSpec(5, "absolute"),
     ResearchSpec(5, "market"),
-    ResearchSpec(5, "sector"),
-    ResearchSpec(21, "market"),
-    ResearchSpec(21, "sector"),
+    ResearchSpec(5, "market", "rank"),
+    ResearchSpec(5, "sector", "rank"),
+    ResearchSpec(21, "market", "rank"),
+    ResearchSpec(21, "sector", "rank"),
 )
 HORIZON_DAYS = PRODUCTION_SPEC.horizon
 TARGET_DESCRIPTION = PRODUCTION_SPEC.description
@@ -93,6 +121,14 @@ TRADING_DAYS_PER_YEAR = 252
 # News timestamps are interpreted in US market time; items at or after the close count toward the next session.
 MARKET_TIMEZONE = "America/New_York"
 MARKET_CLOSE_HOUR = 16
+
+# Untouched holdout: research runs (model comparison, experiments, backtests) never see dates from here
+# on, including labels whose forward window reaches into it. `run_pipeline.py --evaluate-holdout` scores
+# the frozen production setup on it once and logs every evaluation. Override with SP500_HOLDOUT_START,
+# or set it to "none" to research on the full history.
+HOLDOUT_START = os.environ.get("SP500_HOLDOUT_START", "2025-01-01")
+# Walk-forward refits: the model is retrained every this many sessions (about a quarter).
+RETRAIN_EVERY = 63
 
 PRICE_FILE_CANDIDATES = [
     "prices.csv",

@@ -64,11 +64,13 @@ def add_raw_close(prices: pd.DataFrame) -> pd.DataFrame:
     # Product of ratios strictly after each row = reverse cumulative product, shifted by one row.
     after = ratio.groupby(prices["ticker"]).transform(lambda r: r[::-1].cumprod()[::-1].shift(-1).fillna(1.0))
     prices["raw_close"] = prices["close"] * after
+    # Shares reported at the time x split_factor = shares in today's split-adjusted units (for net issuance).
+    prices["split_factor"] = after
     return prices
 
 
 def fetch_prices(tickers: list[str], start: str, end: str | None = None, batch_size: int = 100, downloader=None) -> pd.DataFrame:
-    """Long table: ticker, date, open, high, low, close (split-adjusted), adj_close (dividend-adjusted), volume, splits, raw_close."""
+    """Long table: ticker, date, open, high, low, close (split-adjusted), adj_close (dividend-adjusted), volume, splits, raw_close, split_factor."""
     download = downloader or _import_yfinance().download
     frames = []
     for i in range(0, len(tickers), batch_size):

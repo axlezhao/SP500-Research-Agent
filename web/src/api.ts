@@ -35,7 +35,9 @@ export interface StrategyStats {
   max_drawdown: Num;
   hit_rate: Num;
   avg_turnover: Num;
+  cost_drag?: Num;
   information_ratio?: Num;
+  excess_cagr_vs_equal_weight?: Num;
   ic_mean?: Num;
   ic_tstat?: Num;
 }
@@ -170,14 +172,48 @@ export interface Experiment {
 export interface Spec {
   horizon: number;
   relative_to: string;
+  target?: string;
   description: string;
   label: string;
+}
+
+export interface Construction {
+  construction: string;
+  production: boolean;
+  long_only_cagr: Num;
+  long_only_sharpe: Num;
+  excess_vs_equal_weight: Num;
+  information_ratio: Num;
+  long_only_turnover: Num;
+  long_only_cost_drag: Num;
+  long_short_cagr: Num;
+  long_short_sharpe: Num;
+  long_short_turnover: Num;
+  long_short_cost_drag: Num;
+}
+
+export interface DeflatedSharpe {
+  sharpe_per_period?: Num;
+  trials?: number;
+  expected_max_sharpe_per_period?: Num;
+  probabilistic_sharpe?: Num;
+  deflated_sharpe?: Num;
+}
+
+export interface Robustness {
+  trials_counted?: number;
+  long_short?: DeflatedSharpe;
+  long_only_vs_equal_weight?: DeflatedSharpe;
+  pbo?: { pbo: number; combinations: number; strategies: number; splits: number };
+  breakeven_cost?: { long_only_vs_equal_weight_bps?: Num; long_short_bps?: Num };
+  alpha_confidence?: Record<string, { alpha_low?: Num; alpha_high?: Num; prob_alpha_not_positive?: Num }>;
+  setup_with_highest_ic_tstat?: string;
 }
 
 type StrategySeries = { date: string; long_only: number; long_short: number; benchmark: number; sp500?: number };
 
 export interface BacktestData {
-  config: { holding_days: number; quantile: number; cost_bps: number; neutralize?: string } | null;
+  config: { holding_days: number; quantile: number; cost_bps: number; neutralize?: string; exit_quantile?: Num; smooth_days?: number; construction?: string; cost_model?: string; borrow_bps?: number } | null;
   labels: Record<string, string>;
   summary: (StrategyStats & { strategy: string; information_ratio_vs_sp500?: Num })[];
   growth: StrategySeries[];
@@ -185,6 +221,12 @@ export interface BacktestData {
   attribution: Attribution[];
   quintiles: { quantile: number; mean_return: number; observations: number }[];
   ic: { date: string; ic: Num; ic_rolling: Num }[];
+  constructions?: Construction[];
+  staggered?: { strategy: string; offsets: number; cagr_mean: Num; cagr_min: Num; cagr_max: Num; sharpe_mean: Num; sharpe_min: Num; sharpe_max: Num }[];
+  cost_sensitivity?: { strategy: string; cost_bps: number; cagr: Num; sharpe: Num }[];
+  bootstrap?: { strategy: string; cagr_low: Num; cagr_high: Num; sharpe_low: Num; sharpe_high: Num; prob_sharpe_not_positive: Num }[];
+  french_attribution?: Attribution[];
+  robustness?: Robustness;
 }
 
 export interface ModelData {
@@ -193,11 +235,14 @@ export interface ModelData {
   spec: Spec;
   experiments: Experiment[];
   features: string[];
-  comparison: { model: string; auc_mean: number; auc_std: number; accuracy: number; baseline_accuracy: number; brier: number; ic_mean: Num; ic_tstat: Num }[];
-  folds: { model: string; fold: number; auc: number; test_start: string; test_end: string }[];
+  comparison: { model: string; auc_mean: number; auc_std: number; accuracy: number; baseline_accuracy: number; brier: number; ic_mean: Num; ic_tstat: Num; ic_tstat_nonoverlap?: Num }[];
+  folds: { model: string; fold: number; auc: number; ic_mean?: Num; test_start: string; test_end: string }[];
   calibration: { bucket: number; mean_predicted: number; actual_rate: number; rows: number }[];
   importance: { feature: string; importance_mean: number; importance_std: number }[];
   signals: { signal: string; ic_mean: Num; ic_tstat: Num; ic_positive_share: Num }[];
+  ic_breakdown?: { slice: string; group: string; ic_mean: Num; ic_tstat: Num; ic_days: number }[];
+  ic_decay?: { signal: string; horizon: number; ic_mean: Num; ic_tstat: Num }[];
+  robustness?: Robustness;
   report_available: boolean;
 }
 

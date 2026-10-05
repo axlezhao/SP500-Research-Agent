@@ -261,7 +261,7 @@ def create_app(
             "target": _spec(data.bundle)["description"],
             "horizon_days": _spec(data.bundle)["horizon"],
             "spec": _spec(data.bundle),
-            "model_metrics": to_json_safe({k: v for k, v in data.bundle.get("metrics", {}).items() if k in ("auc_mean", "auc_std", "ic_mean", "ic_tstat", "accuracy", "baseline_accuracy", "oos_start", "oos_end", "folds")}),
+            "model_metrics": to_json_safe({k: v for k, v in data.bundle.get("metrics", {}).items() if k in ("auc_mean", "auc_std", "ic_mean", "ic_tstat", "ic_tstat_nonoverlap", "accuracy", "baseline_accuracy", "oos_start", "oos_end", "folds")}),
             "backtest": backtest,
             "top": tool("rank_stocks", n=10, direction="top")["stocks"],
             "bottom": tool("rank_stocks", n=10, direction="bottom")["stocks"],
@@ -357,6 +357,12 @@ def create_app(
             "drawdown": drawdown,
             "quintiles": _records(artifacts.get("quantile_returns")),
             "ic": to_json_safe(pd.concat([returns[["date", "ic"]], rolling_ic["ic_rolling"]], axis=1)),
+            "constructions": _records(artifacts.get("constructions")),
+            "staggered": _records(artifacts.get("staggered")),
+            "cost_sensitivity": _records(artifacts.get("cost_sensitivity")),
+            "bootstrap": _records(artifacts.get("bootstrap")),
+            "french_attribution": _records(artifacts.get("french_attribution")),
+            "robustness": to_json_safe(artifacts.get("robustness") or {}),
         }
 
     @app.get("/api/model")
@@ -376,6 +382,9 @@ def create_app(
             "calibration": _records(artifacts.get("calibration")),
             "importance": _records(artifacts.get("feature_importance")),
             "signals": _records(artifacts.get("signal_ic")),
+            "ic_breakdown": _records(artifacts.get("ic_breakdown")),
+            "ic_decay": _records(artifacts.get("ic_decay")),
+            "robustness": to_json_safe(artifacts.get("robustness") or {}),
             "report_available": bool(artifacts.get("report")),
         }
 

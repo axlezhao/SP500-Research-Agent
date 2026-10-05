@@ -19,6 +19,10 @@ def test_spec_names_columns_and_rejects_unknown_setups():
         ResearchSpec(10, "market")
     with pytest.raises(ValueError):
         ResearchSpec(5, "industry")
+    with pytest.raises(ValueError):
+        ResearchSpec(5, "absolute", "rank")  # a rank is always relative to peers
+    ranked = ResearchSpec(21, "sector", "rank")
+    assert (ranked.target_column, ranked.binary_column) == ("target_rank_sector_21d", "target_beat_sector_21d")
     assert backtest_config_for(spec).neutralize == "sector" and backtest_config_for(spec).holding_days == 21
     assert backtest_config_for(ResearchSpec(5, "market"), BacktestConfig(cost_bps=3)).cost_bps == 3
 
@@ -34,7 +38,7 @@ def test_monthly_targets_and_sector_relative_split(live_features):
 
 
 def test_monthly_walk_forward_uses_a_21_session_gap(live_features):
-    result = walk_forward(live_features, "logistic_regression", n_splits=3, spec=ResearchSpec(21, "market"))
+    result = walk_forward(live_features, "ridge", n_splits=3, spec=ResearchSpec(21, "market", "rank"))
     dates = sorted(live_features["date"].unique())
     position = {d: i for i, d in enumerate(dates)}
     for fold in result.fold_metrics.itertuples():
@@ -101,7 +105,17 @@ def test_attribution_recovers_known_exposures():
 
 def test_experiments_run_each_setup_on_live_like_data(live_features):
     rate = live_features.groupby("date")["tbill_3m"].first() / 100
-    table = run_experiments(live_features, (ResearchSpec(5, "market"), ResearchSpec(21, "sector")), 3, 50_000, None, rate, None, production=ResearchSpec(5, "market"))
-    assert list(table["setup"]) == ["5-day, vs. all members", "21-day, vs. own sector"]
+    specs = (ResearchSpec(5, "market"), ResearchSpec(21, "sector", "rank"))
+    table, trials = run_experiments(live_features, specs, 3, 50_000, None, rate, None, production=ResearchSpec(5, "market"))
+    assert list(table["setup"]) == ["5-day, vs. all members", "21-day, vs. own sector, ranked"]
+    assert table["model"].tolist() == ["logistic_regression", "ridge"]
     assert table["production"].tolist() == [True, False]
     assert table.loc[1, "portfolio"] == "sector-neutral" and table["auc"].notna().all()
+    assert len(trials) == 2 and all(len(series) > 0 for series in trials.values())
+
+
+def test_attribution_drops_factors_the_data_cannot_build():
+    rng = np.random.default_rng(2)
+    factors = pd.DataFrame({"MKT": rng.normal(0, 0.02, 200), "SMB": np.nan, "MOM": rng.normal(0, 0.01, 200)})
+    stats = regress(0.9 * factors["MKT"] + rng.normal(0, 0.002, 200), factors, periods_per_year=50)
+    assert stats["beta_MKT"] == pytest.approx(0.9, abs=0.05) and "beta_SMB" not in stats

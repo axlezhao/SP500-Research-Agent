@@ -55,6 +55,8 @@ Settings live in `.env` at the project root, which git ignores; start from `.env
 | `FINNHUB_API_KEY` | Optional news source | Without it, headlines come from Yahoo Finance RSS. |
 | `DEMO_MODE`, `CHAT_LIMIT_PER_HOUR`, `CHAT_LIMIT_PER_DAY`, `ADMIN_TOKEN` | Public deployments | See [DEPLOY.md](DEPLOY.md). |
 | `SP500_HOME` | Installs outside the source tree | Folder that holds `data/`, `models/`, `reports/` and `web/dist`. |
+| `SP500_HOLDOUT_START` | Moving the holdout | First date of the untouched holdout (default `2025-01-01`), or `none`. Same as `--holdout-start`. |
+| `SENTIMENT_MODEL`, `LM_DICTIONARY_PATH` | Headline sentiment | `lexicon` (default), `lm` (the Loughran-McDonald dictionary CSV from sraf.nd.edu at `LM_DICTIONARY_PATH`) or `finbert` (`pip install -e ".[finbert]"`). |
 
 Without any LLM key, everything still works except the AI agent, which falls back to a rule-based assistant.
 
@@ -64,8 +66,10 @@ Without any LLM key, everything still works except the AI agent, which falls bac
 |---|---|---|---|
 | Wikipedia | Today's S&P 500 list (sector, CIK) and every index change since 1976 | Public | 7 days |
 | Yahoo Finance (`yfinance`) | Daily prices adjusted for splits and dividends; split history; SPY for the benchmark | No key, unofficial | 12 hours |
-| SEC EDGAR | Every figure in 10-K and 10-Q filings, with filing dates | `SEC_USER_AGENT` | 7 days |
+| SEC EDGAR | Every figure in 10-K and 10-Q filings, with filing dates; each company's industry (SIC) code and earnings-release dates | `SEC_USER_AGENT` | 7 days |
+| SEC insider data sets | Insider purchases and sales (Forms 3, 4, 5), quarterly; only with `--insiders` | `SEC_USER_AGENT` | 30 days |
 | FRED | VIX, 3-month T-bill and 10-year Treasury yields | Public | 12 hours |
+| Kenneth French data library | Daily Fama-French five factors, momentum and short-term reversal | Public | 7 days |
 | Yahoo Finance RSS or Finnhub | Recent headlines, fetched when the agent or a stock page asks | RSS: none; Finnhub: key | Per session |
 
 - **Cache:** downloads are kept in `data/raw/live/`; `--refresh` ignores it.
@@ -85,10 +89,21 @@ python run_pipeline.py [options]
 | `--start 2014-01-01` | 2014-01-01 | First date downloaded (live) |
 | `--limit N` | all | Only the first N current members: a quick run of under a minute, with no survivorship handling |
 | `--refresh` | off | Ignore the download cache |
-| `--folds 5` | 5 | Walk-forward folds |
-| `--cost-bps 10` | 10 | Backtest cost per unit of weight traded |
-| `--quantile 0.2` | 0.2 | Share of stocks held long (and short) |
+| `--insiders` | off | Also download SEC insider-trading data (large; cached for 30 days) |
+| `--retrain-every 63` | 63 | Refit the model every N sessions out of sample (0 = use `--folds` equal blocks) |
+| `--folds 5` | 5 | Walk-forward folds when `--retrain-every 0` |
+| `--no-tune` | off | Skip the hyperparameter search inside each training window (faster) |
+| `--holdout-start 2025-01-01` | 2025-01-01 | First date of the untouched holdout; `none` researches on everything |
+| `--evaluate-holdout` | off | Score the saved production model on the holdout, log the evaluation, and stop |
+| `--cost-model spread\|flat` | `spread` | Per-stock costs scaled by each stock's estimated bid-ask spread (the median stock pays `--cost-bps`), or a flat `--cost-bps` for all |
+| `--cost-bps 10` | 10 | Cost per unit of weight traded (for the median stock with `spread`) |
+| `--borrow-bps 0` | 0 | Annual fee for borrowing shorted stock |
+| `--quantile 0.2` | 0.2 | Share of stocks bought (and shorted) |
+| `--exit-quantile 0.4` | 0.4 | Buffer: keep a holding until it leaves this top share (set equal to `--quantile` for none) |
+| `--smooth-days 3` | 3 | Rank on each stock's score averaged over this many sessions |
+| `--construction quantile\|optimizer` | `quantile` | The production portfolio: quantile ranks, or the cost-aware, factor-neutral optimiser |
 | `--max-rows 150000` | 150,000 | Cap on training rows per model fit, for speed |
+| `--bootstrap-reps 2000` | 2,000 | Resamples for the bootstrap confidence intervals |
 | `--skip-experiments` | off | Don't compare the alternative research setups (faster) |
 | `--make-sample`, `--download-kaggle`, `--from-zip PATH`, `--overwrite` | | Prepare the sample or Kaggle data, then run on it |
 
@@ -98,9 +113,13 @@ A full live run takes about 4–5 minutes the first time and 2–3 minutes from 
 |---|---|
 | `data/processed/` | Feature table, fundamentals, macro data, index membership, benchmark prices, data-quality report |
 | `models/return_direction_model.joblib` | The production model, with its validation metrics and research setup |
-| `reports/research/` | Walk-forward predictions, model comparison, calibration, feature importance, backtest, attribution, setups compared, and `research_report.md` |
+| `reports/research/` | Walk-forward predictions, model comparison, calibration, feature importance, IC breakdown and decay, backtest, portfolio constructions, staggered starts, cost sensitivity, bootstrap intervals, overfitting statistics, attribution (home-made and Fama-French), setups compared, and `research_report.md` |
+| `reports/research/holdout_log.jsonl` | One line per holdout evaluation (`--evaluate-holdout`) |
+| `reports/live_signals/` | Each run's live ranking, scored by later runs once returns are known (the forward test) |
 
-What the model predicts is set in `src/sp500_agent/config.py` (`PRODUCTION_SPEC`, `EXPERIMENT_SPECS`). The default predicts whether a stock beats the median index member over the next 5 trading days. [FINDINGS.md](FINDINGS.md) explains why.
+What the model predicts is set in `src/sp500_agent/config.py` (`PRODUCTION_SPEC`, `EXPERIMENT_SPECS`). The default scores each stock's probability of beating a randomly chosen index member over the next 5 trading days, after scaling for volatility (a ranked target). [FINDINGS.md](FINDINGS.md) explains the earlier yes/no setups.
+
+**The holdout, step by step.** Research never sees data from `--holdout-start` on. When a setup is final, run `python run_pipeline.py --evaluate-holdout` once: it walks the saved model (same hyperparameters, same portfolio) through the holdout and logs the result. Each further evaluation is logged too, and the command tells you when the holdout has already been looked at: from then on it is no longer untouched, and only the forward test in `reports/live_signals/` is.
 
 ## Use the dashboard
 

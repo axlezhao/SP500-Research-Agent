@@ -35,7 +35,7 @@ def test_overview(client):
     assert body["model_metrics"]["auc_mean"] is not None
     assert set(body["backtest"]) == {"long_only", "long_short", "benchmark"}
     assert body["macro"]["series"]["vix"]["latest"] is not None
-    assert "beat the median" in body["target"]
+    assert "beat a randomly chosen" in body["target"]
 
 
 def test_stocks_list_and_search(client):
@@ -69,7 +69,11 @@ def test_backtest_model_and_data(client):
     assert backtest["growth"][0].keys() >= {"date", "long_only", "long_short", "benchmark"}
     assert min(row["benchmark"] for row in backtest["drawdown"]) <= 0
     model = client.get("/api/model").json()
-    assert len(model["comparison"]) == 3 and model["calibration"] and model["features"]
+    assert len(model["comparison"]) == 4 and model["calibration"] and model["features"]
+    assert model["comparison"][0]["ic_tstat"] >= model["comparison"][-1]["ic_tstat"]  # ranked by IC t-stat
+    assert model["ic_decay"] and "robustness" in model
+    assert {row["construction"] for row in backtest["constructions"]} >= {"Top 20%, no buffer (original)"}
+    assert backtest["cost_sensitivity"] and backtest["staggered"]
     assert client.get("/api/model/report").text.startswith("# S&P 500 Research Report")
     data = client.get("/api/data").json()
     assert data["macro"] and data["index_changes"]

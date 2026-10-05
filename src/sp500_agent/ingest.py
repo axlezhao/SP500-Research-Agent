@@ -1,7 +1,8 @@
 """Assemble a dataset from live public sources, the Kaggle files, or the synthetic sample.
 
 Live sources are cached under data/raw/live/ and refreshed when older than their maximum age
-(prices and macro: 12 hours; membership and fundamentals: 7 days) or when `refresh=True`.
+(prices and macro: 12 hours; membership, fundamentals, filings and factors: 7 days; insider trades:
+30 days) or when `refresh=True`.
 """
 
 from __future__ import annotations
@@ -19,15 +20,27 @@ from .data_loader import load_fundamentals, load_news, load_prices
 
 LIVE_DIR = RAW_DIR / "live"
 DEFAULT_START = "2014-01-01"
-MAX_AGE = {"universe": timedelta(days=7), "prices": timedelta(hours=12), "benchmark": timedelta(hours=12), "fundamentals": timedelta(days=7), "macro": timedelta(hours=12)}
+MAX_AGE = {
+    "universe": timedelta(days=7), "prices": timedelta(hours=12), "benchmark": timedelta(hours=12), "fundamentals": timedelta(days=7),
+    "events": timedelta(days=7), "macro": timedelta(hours=12), "french": timedelta(days=7), "insiders": timedelta(days=30),
+}
+# Bump when the fundamentals table gains columns, so caches built by older code are refetched.
+FUNDAMENTALS_VERSION = 2
 # The S&P 500 itself, for comparison: SPY's dividend-adjusted price (a total-return proxy).
 INDEX_SYMBOL = "SPY"
 EXTREME_DAILY_MOVE = 0.4
 # A former member's price history must cover at least this share of its time in the index; otherwise the
 # symbol has most likely been reused by a different company (e.g. STI: SunTrust until 2019, another firm later).
 MIN_MEMBERSHIP_COVERAGE = 0.5
-# Former members' prices are kept this long after they leave the index (enough to close positions), then dropped.
-POST_REMOVAL_DAYS = 15
+# Former members' prices are kept this long after they leave the index, then dropped. It must cover the
+# longest holding period (21 sessions plus the execution lag, about 31 calendar days with holidays), or a
+# position opened just before the removal would lose its exit price and look like a delisting.
+POST_REMOVAL_DAYS = 45
+# A stock whose prices stop while it is still trading in the backtest is either acquired (its last price is
+# about the deal price: delisting return 0) or delisted for poor performance, where the last quoted price
+# overstates what holders got. Shumway (1997) estimates about -30% for the latter.
+PERFORMANCE_DELISTING_RETURN = -0.30
+PERFORMANCE_WORDS = ("bankrupt", "chapter 11", "delist", "default", "insolv", "liquidat")
 
 
 @dataclass
@@ -41,7 +54,18 @@ class Dataset:
     membership: pd.DataFrame | None = None
     index_changes: pd.DataFrame | None = None
     index_prices: pd.Series | None = None  # S&P 500 total-return proxy by date
+    eps: pd.DataFrame | None = None  # quarterly EPS as first reported (ticker, period_end, eps, filed)
+    earnings_dates: pd.DataFrame | None = None  # earnings releases, 8-K item 2.02 (ticker, date, accepted)
+    insiders: pd.DataFrame | None = None  # insider open-market purchases and sales (ticker, filed, accession, code, shares, value)
+    factors: pd.DataFrame | None = None  # Kenneth French daily factor returns
+    delistings: pd.DataFrame | None = None  # stocks whose prices end early (ticker, last_date, reason, delisting_return)
     quality: dict = field(default_factory=dict)
+
+    @property
+    def delisting_returns(self) -> dict:
+        if self.delistings is None or self.delistings.empty:
+            return {}
+        return dict(zip(self.delistings["ticker"], self.delistings["delisting_return"]))
 
 
 # -- cache ------------------------------------------------------------------------------------------
@@ -90,8 +114,10 @@ def load_live(
     sec_client=None,
     price_downloader=None,
     log=print,
+    insiders: bool = False,
+    factors: bool = True,
 ) -> Dataset:
-    from .sources import fred, sec, wikipedia, yahoo
+    from .sources import fred, french, sec, wikipedia, yahoo
     from .sources.http import HttpClient
 
     client = client or HttpClient(max_per_second=4)
@@ -123,7 +149,8 @@ def load_live(
     index_prices = spy.set_index("date")["adj_close"].fillna(spy.set_index("date")["close"]).rename(INDEX_SYMBOL) if not spy.empty else None
     priced = sorted(price_frame["ticker"].unique())
 
-    fundamentals, sec_failures = None, {}
+    fundamentals, eps, sec_failures = None, None, {}
+    industries, earnings_dates, insider_trades = None, None, None
     try:
         sec_http = sec_client or sec.sec_client()
     except RuntimeError as exc:
@@ -134,20 +161,46 @@ def load_live(
             cik_map = sec.fetch_cik_map(sec_http)
             wiki_ciks = dict(zip(constituents["ticker"], constituents["cik"]))
             ciks = {t: int(wiki_ciks[t]) if pd.notna(wiki_ciks.get(t)) else cik_map[t] for t in priced if pd.notna(wiki_ciks.get(t)) or t in cik_map}
-            table, failed = sec.fetch_fundamentals(sec_http, ciks, on_progress=lambda done, total: log(f"    {done}/{total} companies"))
+            table, eps_table, failed = sec.fetch_company_facts(sec_http, ciks, on_progress=lambda done, total: log(f"    {done}/{total} companies"))
             cik_frame = pd.DataFrame({"ticker": list(ciks), "cik": list(ciks.values())})
-            return {"fundamentals": table, "ciks": cik_frame}, {"failed": failed, "without_cik": sorted(set(priced) - set(ciks))}
+            return {"fundamentals": table, "eps": eps_table, "ciks": cik_frame}, {"failed": failed, "without_cik": sorted(set(priced) - set(ciks))}
 
-        parts = _cached(cache_dir, "fundamentals", {"tickers": len(priced), "limit": limit, "start": start}, refresh, fundamentals_fetch, log)
-        fundamentals, ciks = parts["fundamentals"], parts["ciks"]
+        params = {"tickers": len(priced), "limit": limit, "start": start, "version": FUNDAMENTALS_VERSION}
+        parts = _cached(cache_dir, "fundamentals", params, refresh, fundamentals_fetch, log)
+        fundamentals, eps, ciks = parts["fundamentals"], parts["eps"], parts["ciks"]
         sec_failures = _read_meta(cache_dir).get("fundamentals", {}).get("failed", {})
+        cik_dict = {t: int(c) for t, c in zip(ciks["ticker"], ciks["cik"])}
+
+        def events_fetch():
+            table, releases, failed = sec.fetch_company_events(sec_http, cik_dict, since=start, on_progress=lambda done, total: log(f"    {done}/{total} filing indexes"))
+            return {"industries": table, "earnings_dates": releases}, {"failed": failed}
+
+        try:
+            events = _cached(cache_dir, "events", {"tickers": len(cik_dict), "start": start}, refresh, events_fetch, log)
+            industries, earnings_dates = events["industries"], events["earnings_dates"]
+        except Exception as exc:  # industry codes and release dates improve the research but aren't essential
+            log(f"  events: skipped ({type(exc).__name__}: {exc})")
+        if insiders:
+            from .sources import insiders as insider_source
+
+            def insiders_fetch():
+                trades, failed = insider_source.fetch_insider_trades(sec_http, cik_dict, start, on_progress=lambda q: log(f"    insider trades {q}"))
+                return {"insiders": trades}, {"failed": failed}
+
+            insider_trades = _cached(cache_dir, "insiders", {"tickers": len(cik_dict), "start": start}, refresh, insiders_fetch, log)["insiders"]
     else:
         ciks = pd.DataFrame({"ticker": constituents["ticker"], "cik": constituents["cik"]}).dropna()
 
     macro = _cached(cache_dir, "macro", {"start": start}, refresh, lambda: ({"macro": fred.fetch_macro(start=start)}, {}), log)["macro"]
+    factor_frame = None
+    if factors:
+        try:
+            factor_frame = _cached(cache_dir, "french", {}, refresh, lambda: ({"french": french.fetch_factors(client)}, {}), log)["french"]
+        except Exception as exc:
+            log(f"  french: skipped ({type(exc).__name__}: {exc})")
 
-    companies = _companies(constituents, changes, ciks, priced)
-    prices_out = price_frame.assign(close=price_frame["adj_close"].fillna(price_frame["close"]))[["ticker", "date", "close", "volume", "raw_close"]]
+    companies = _companies(constituents, changes, ciks, priced, industries)
+    prices_out = live_price_table(price_frame)
     dataset = Dataset(
         source="live",
         prices=prices_out,
@@ -157,6 +210,11 @@ def load_live(
         membership=membership,
         index_changes=changes,
         index_prices=index_prices,
+        eps=eps,
+        earnings_dates=earnings_dates,
+        insiders=insider_trades,
+        factors=factor_frame,
+        delistings=delistings(price_frame, changes, membership),
     )
     meta = _read_meta(cache_dir)
     dataset.quality = data_quality(
@@ -170,6 +228,51 @@ def load_live(
     if "survivorship" in dataset.quality:
         dataset.quality["survivorship"].update(cleaning)
     return dataset
+
+
+def live_price_table(price_frame: pd.DataFrame) -> pd.DataFrame:
+    """Prices for the features: dividend-adjusted close (total return), as-traded close, volume, the split factor,
+    and highs and lows rescaled to the dividend-adjusted basis (for spread estimates)."""
+    adjusted = price_frame["adj_close"].fillna(price_frame["close"])
+    factor = adjusted / price_frame["close"]
+    out = price_frame.assign(close=adjusted)
+    columns = ["ticker", "date", "close", "volume", "raw_close"]
+    if {"high", "low"} <= set(price_frame.columns):
+        out = out.assign(high=price_frame["high"] * factor, low=price_frame["low"] * factor)
+        columns += ["high", "low"]
+    if "split_factor" in price_frame.columns:
+        columns.append("split_factor")
+    return out[columns]
+
+
+def delistings(prices: pd.DataFrame, changes: pd.DataFrame | None, membership: pd.DataFrame | None) -> pd.DataFrame:
+    """Stocks whose price history stops before the data ends, other than because the index dropped them.
+
+    Each gets a delisting return for the features: PERFORMANCE_DELISTING_RETURN when Wikipedia's removal
+    reason mentions bankruptcy or delisting, or the price fell by more than half over its last quarter; 0
+    (a merger at roughly the last price) otherwise.
+    """
+    columns = ["ticker", "last_date", "reason", "delisting_return"]
+    if prices.empty:
+        return pd.DataFrame(columns=columns)
+    data_end = prices["date"].max()
+    last = prices.sort_values("date").groupby("ticker").agg(last_date=("date", "max"), last_close=("close", "last"))
+    quarter_ago = prices.sort_values("date").groupby("ticker")["close"].apply(lambda c: c.iloc[-63] if len(c) >= 63 else np.nan)
+    last["quarter_return"] = last["last_close"] / quarter_ago - 1
+    ended = last[last["last_date"] < data_end - pd.Timedelta(days=10)].copy()
+    if membership is not None and not membership.empty:
+        # Prices trimmed POST_REMOVAL_DAYS after an index removal didn't end: the stock kept trading.
+        removal = membership.groupby("ticker")["end"].max()
+        trimmed = removal.reindex(ended.index).notna() & (ended["last_date"] >= removal.reindex(ended.index) + pd.Timedelta(days=POST_REMOVAL_DAYS - 7))
+        ended = ended[~trimmed]
+    reasons = {}
+    if changes is not None and "reason" in changes.columns:
+        removed = changes.dropna(subset=["removed"]).drop_duplicates("removed", keep="first")
+        reasons = dict(zip(removed["removed"], removed["reason"].astype(str)))
+    ended["reason"] = [reasons.get(t, "") for t in ended.index]
+    poor = ended["reason"].astype(str).str.lower().str.contains("|".join(PERFORMANCE_WORDS)) | (ended["quarter_return"] < -0.5)
+    ended["delisting_return"] = np.where(poor, PERFORMANCE_DELISTING_RETURN, 0.0)
+    return ended.reset_index()[columns]
 
 
 def clean_former_members(prices: pd.DataFrame, membership: pd.DataFrame, current: set[str], since: str) -> tuple[pd.DataFrame, dict]:
@@ -210,17 +313,32 @@ def clean_former_members(prices: pd.DataFrame, membership: pd.DataFrame, current
     }
 
 
-def _companies(constituents: pd.DataFrame, changes: pd.DataFrame, ciks: pd.DataFrame, priced: list[str]) -> pd.DataFrame:
+def _companies(constituents: pd.DataFrame, changes: pd.DataFrame, ciks: pd.DataFrame, priced: list[str], industries: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Company names, sectors and industries for every priced ticker.
+
+    Current members carry their GICS sector from Wikipedia. Former members have none on record; giving them
+    a placeholder such as "Unknown" would hand the model a flag meaning "this stock will leave the index",
+    which is information from the future. Their sector comes from their SEC industry (SIC) code instead,
+    and stays missing when there is none. `industry` (the SIC major group) is defined the same way for all.
+    """
+    from .sources.sec import sic_industry, sic_sector
+
     current = constituents[["ticker", "company_name", "sector", "sub_industry"]]
     removed = (
         changes.dropna(subset=["removed"])
         .drop_duplicates("removed")
         .rename(columns={"removed": "ticker", "removed_name": "company_name"})[["ticker", "company_name"]]
     )
-    removed = removed[~removed["ticker"].isin(current["ticker"])].assign(sector="Unknown", sub_industry=None)
+    removed = removed[~removed["ticker"].isin(current["ticker"])].assign(sector=None, sub_industry=None)
     companies = pd.concat([current, removed], ignore_index=True)
     companies = companies[companies["ticker"].isin(priced)]
-    return companies.merge(ciks, on="ticker", how="left").reset_index(drop=True)
+    companies = companies.merge(ciks, on="ticker", how="left")
+    if industries is not None and not industries.empty:
+        companies = companies.merge(industries[["ticker", "sic", "sic_description"]], on="ticker", how="left")
+        missing = companies["sector"].isna()
+        companies.loc[missing, "sector"] = companies.loc[missing, "sic"].map(sic_sector)
+        companies["industry"] = companies["sic"].map(sic_industry)
+    return companies.reset_index(drop=True)
 
 
 # -- kaggle / sample --------------------------------------------------------------------------------
@@ -284,6 +402,19 @@ def data_quality(dataset: Dataset, requested=None, former_members=None, membersh
             "failed": len(sec_failures or {}),
             "failed_examples": dict(list((sec_failures or {}).items())[:5]),
         }
+    if dataset.companies is not None and "sic" in dataset.companies.columns:
+        report["industries"] = {
+            "share_with_sic_code": round(float(dataset.companies["sic"].notna().mean()), 3),
+            "former_members_with_sector": int(dataset.companies.loc[dataset.companies["sub_industry"].isna(), "sector"].notna().sum()),
+        }
+    if dataset.earnings_dates is not None:
+        report["earnings_releases"] = {"releases": int(len(dataset.earnings_dates)), "tickers": int(dataset.earnings_dates["ticker"].nunique())}
+    if dataset.delistings is not None:
+        report["delistings"] = {
+            "stocks_ending_early": int(len(dataset.delistings)),
+            "assumed_performance_delistings": int((dataset.delistings["delisting_return"] < 0).sum()),
+            "note": "Kept in the backtest to their last price (mergers) or with a -30% delisting return (failures), rather than dropped.",
+        }
     if dataset.macro is not None and not dataset.macro.empty:
         report["macro"] = {col: str(dataset.macro.loc[dataset.macro[col].notna(), "date"].max().date()) for col in dataset.macro.columns if col != "date"}
     if fetched_at:
@@ -298,7 +429,7 @@ def save_dataset_extras(dataset: Dataset, directory: Path = PROCESSED_DIR) -> No
         dataset.index_prices.rename("close").rename_axis("date").reset_index().to_parquet(directory / "benchmark.parquet", index=False)
     elif (directory / "benchmark.parquet").exists():
         (directory / "benchmark.parquet").unlink()
-    for name in ["fundamentals", "macro", "membership", "index_changes"]:
+    for name in ["fundamentals", "macro", "membership", "index_changes", "eps", "earnings_dates", "insiders", "factors", "delistings"]:
         frame = getattr(dataset, name)
         path = directory / f"{name}.parquet"
         if frame is not None:

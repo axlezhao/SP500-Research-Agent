@@ -2,6 +2,8 @@
 
 *Live run of 2 October 2026. Data from January 2014 to October 2026; out-of-sample period May 2020 to September 2026.*
 
+> **These results predate the October 2026 research overhaul** ([ROADMAP](ROADMAP.md#done)). That run still had three biases since fixed: former members were labelled sector "Unknown" (a hint that they would leave the index), stocks that stopped trading were dropped from the backtest on the signal date, and "5 days ago" counted rows rather than sessions. It also predicted a yes/no label, chose models by AUC, and traded a plain weekly top 20% at a flat cost. The current pipeline uses a ranked target, more signals, cost-aware portfolios, an untouched holdout from 2025 and deflated statistics, so the numbers below will change. Re-run `python run_pipeline.py` and read `reports/research/research_report.md` for current results.
+
 ## Summary
 
 **Question.** Can a model built only from free public data (prices, SEC filings and macro series) rank S&P 500 stocks well enough to beat holding the index, after trading costs?
